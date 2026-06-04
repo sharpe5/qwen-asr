@@ -181,6 +181,43 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     int chunk_size = cfg->enc_chunk_size;          /* 100 */
     int n_window_infer = cfg->enc_n_window_infer;  /* 800 */
 
+    /* ANE-prototype injection: QWEN_LOAD_ENC=<file> bypasses the encoder and
+     * returns a precomputed encoder output ([tokens x output_dim] f32 with a
+     * 2-int header), so the decoder can run on a CoreML/ANE-produced tensor. */
+    const char *load_enc = getenv("QWEN_LOAD_ENC");
+    if (load_enc) {
+        FILE *fp = fopen(load_enc, "rb");
+        if (!fp) { fprintf(stderr, "[inject] cannot open %s\n", load_enc); return NULL; }
+        int dims[2];
+        if (fread(dims, sizeof(int), 2, fp) != 2) { fclose(fp); return NULL; }
+        size_t n = (size_t)dims[0] * dims[1];
+        float *buf = (float *)malloc(n * sizeof(float));
+        size_t got = fread(buf, sizeof(float), n, fp);
+        fclose(fp);
+        if (got != n) { free(buf); fprintf(stderr, "[inject] short read\n"); return NULL; }
+        fprintf(stderr, "[inject] loaded encoder output %dx%d from %s\n",
+                dims[0], dims[1], load_enc);
+        *out_seq_len = dims[0];
+        return buf;
+    }
+
+    /* ANE-prototype fidelity dump: QWEN_DUMP_ENC=<prefix> writes the raw mel
+     * input as <prefix>.mel.bin ([128 x mel_frames] f32, row-major) for use as
+     * a reference input. Encoder output is dumped at function exit. */
+    const char *dump_prefix = getenv("QWEN_DUMP_ENC");
+    if (dump_prefix) {
+        char fn[1024];
+        snprintf(fn, sizeof(fn), "%s.mel.bin", dump_prefix);
+        FILE *fp = fopen(fn, "wb");
+        if (fp) {
+            int dims[2] = {128, mel_frames};
+            fwrite(dims, sizeof(int), 2, fp);
+            fwrite(mel, sizeof(float), (size_t)128 * mel_frames, fp);
+            fclose(fp);
+            fprintf(stderr, "[dump] wrote %s (mel 128x%d)\n", fn, mel_frames);
+        }
+    }
+
 
     /* ---- Per-chunk Conv2D stem ---- */
     /* mel: [128, mel_frames] (already in Conv2D-friendly layout)
@@ -360,6 +397,19 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     qwen_linear(enc_output, proj_mid, enc->proj2_weight, enc->proj2_bias,
                  total_tokens, d_model, output_dim);
     free(proj_mid);
+
+    if (dump_prefix) {
+        char fn[1024];
+        snprintf(fn, sizeof(fn), "%s.encout.bin", dump_prefix);
+        FILE *fp = fopen(fn, "wb");
+        if (fp) {
+            int dims[2] = {total_tokens, output_dim};
+            fwrite(dims, sizeof(int), 2, fp);
+            fwrite(enc_output, sizeof(float), (size_t)total_tokens * output_dim, fp);
+            fclose(fp);
+            fprintf(stderr, "[dump] wrote %s (encout %dx%d)\n", fn, total_tokens, output_dim);
+        }
+    }
 
     /* Clean up */
     free(x); free(x_norm); free(q); free(k); free(v);

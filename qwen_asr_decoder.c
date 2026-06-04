@@ -355,6 +355,36 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
 
     }
 
+    /* Single-step fidelity capture: QWEN_DUMP_DEC=<prefix> dumps the real prefill
+     * input embeddings, the last-position final-normed hidden, and its argmax
+     * token id, so a CoreML/GPU decoder can be validated against this reference. */
+    const char *dd = getenv("QWEN_DUMP_DEC");
+    if (dd) {
+        char fn[1024]; FILE *fp;
+        snprintf(fn, sizeof(fn), "%s.demb.bin", dd);
+        if ((fp = fopen(fn, "wb"))) {
+            int d[3] = {seq_len, dim, start_pos};
+            fwrite(d, sizeof(int), 3, fp);
+            fwrite(input_embeds, sizeof(float), (size_t)seq_len * dim, fp);
+            fclose(fp);
+        }
+        float *hid = (float *)malloc((size_t)dim * sizeof(float));
+        qwen_rms_norm(hid, x + (size_t)(seq_len - 1) * dim, dec->norm, 1, dim, eps);
+        snprintf(fn, sizeof(fn), "%s.dhid.bin", dd);
+        if ((fp = fopen(fn, "wb"))) {
+            int d1[1] = {dim};
+            fwrite(d1, sizeof(int), 1, fp);
+            fwrite(hid, sizeof(float), dim, fp);
+            fclose(fp);
+        }
+        int tok = qwen_argmax_matvec_bf16(hid, dec->tok_embeddings_bf16, dim, cfg->vocab_size);
+        snprintf(fn, sizeof(fn), "%s.dtok.bin", dd);
+        if ((fp = fopen(fn, "wb"))) { fwrite(&tok, sizeof(int), 1, fp); fclose(fp); }
+        free(hid);
+        fprintf(stderr, "[decdump] seq=%d dim=%d start_pos=%d argmax_tok=%d -> %s.*\n",
+                seq_len, dim, start_pos, tok, dd);
+    }
+
     ctx->kv_cache_len = start_pos + seq_len;
 }
 
