@@ -17,16 +17,17 @@ Both the 0.6B and 1.7B parameters models are supported. While the 1.7B model is 
 ## Quick Start
 
 ```bash
-# Build
+# Build  (optional: `brew install libsndfile` first, to read Opus/Ogg/FLAC/MP3 via -i)
 make blas
 
 # Download a model (interactive selector: small=0.6B, large=1.7B)
 ./download_model.sh
 
-# Transcribe audio (tokens stream to stdout as generated)
-./qwen_asr -d qwen3-asr-0.6b -i audio.wav
+# Transcribe audio (tokens stream to stdout as generated).
+# -i reads WAV directly, plus Opus/Ogg/FLAC/MP3 when built with libsndfile.
+./qwen_asr -d qwen3-asr-0.6b -i audio.opus
 
-# Pipe any format via ffmpeg
+# Or pipe any source/format via ffmpeg (always works, no libsndfile needed)
 ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
     ./qwen_asr -d qwen3-asr-0.6b --stdin
 
@@ -36,7 +37,7 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 
 ## Features
 
-- **Almost zero dependencies**: Pure C implementation. Only needs BLAS (Accelerate on macOS, OpenBLAS on Linux).
+- **Almost zero dependencies**: Pure C implementation. Needs BLAS (Accelerate on macOS, OpenBLAS on Linux); optional libsndfile enables Opus/Ogg/FLAC/MP3 input.
 - **Both models**: Automatically detects Qwen3-ASR-0.6B or 1.7B from the weight files.
 - **Streaming output**: Tokens are printed to stdout as they are generated, word by word, even in offline mode (no `--stream`).
 - **Streaming mode**: `--stream` processes audio in chunks with prefix rollback. A sliding window bounds encoder and decoder context for indefinite streaming.
@@ -45,7 +46,7 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 - **Prompt biasing**: `--prompt` injects a system prompt to bias the model toward specific terms or spellings. Note that prompt biasing is very soft. The models may or may not care about your instructions. Usually spelling instructions are followed decently.
 - **Optional silence skipping**: `--skip-silence` drops long silent spans before inference (off by default). It may use less CPU for the same file.
 - **Memory-mapped weights**: BF16 weights are mmap'd directly from safetensors files — loading is near-instant.
-- **WAV input**: Supports 16-bit PCM WAV files at any sample rate (auto-resampled to 16kHz).
+- **File input**: 16-bit PCM WAV at any sample rate (auto-resampled to 16kHz); also Opus/Ogg/FLAC/MP3 via `-i` when built with libsndfile.
 - **Stdin input**: Reads from stdin with auto-detection (WAV header or raw s16le 16kHz mono).
 - **Optional segment splitting**: use `-S 20` / `-S 30` for large files with segment-cutting silence search (`-W 3`).
 

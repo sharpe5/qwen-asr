@@ -31,7 +31,7 @@ Architecture/background references:
 - Offline full-context (default): `-S 0`
 - Offline segmented: `-S <secs>`
 - Streaming: `--stream`
-- Input from file: `-i file.wav`
+- Input from file: `-i file.wav` (also Opus/Ogg/FLAC/MP3 when built with libsndfile)
 - Input from stdin: `--stdin` (WAV or raw s16le 16k mono)
 
 ## User-Facing Behavior Contract (Do Not Break)
@@ -106,6 +106,11 @@ Build:
 ```bash
 make blas
 ```
+
+Optional: `brew install libsndfile` before building enables native `-i` decode of
+Opus/Ogg/FLAC/MP3 (auto-detected by the Makefile via `brew --prefix libsndfile` →
+`-DHAVE_SNDFILE`). Without it the build still works (WAV/stdin only). After a Makefile
+change, prefer `make clean && make <target>` to avoid a stale `qwen_asr_audio.o`.
 
 Smoke run:
 ```bash

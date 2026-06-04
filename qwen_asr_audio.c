@@ -19,6 +19,10 @@
 #include <math.h>
 #include <limits.h>
 
+#ifdef HAVE_SNDFILE
+#include <sndfile.h>   /* native opus/ogg/flac/mp3/... decode for -i (non-WAV inputs) */
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -167,24 +171,86 @@ float *qwen_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_s
     return samples;
 }
 
+#ifdef HAVE_SNDFILE
+/* Decode any libsndfile-supported file (opus/ogg/flac/mp3/...) → mono int16 PCM,
+ * wrap it in an in-memory WAV, and reuse qwen_parse_wav_buffer (which resamples to
+ * 16kHz). This keeps the tested WAV path as the single resample/mel front-end. */
+static float *load_via_sndfile(const char *path, int *out_n_samples) {
+    SF_INFO info; memset(&info, 0, sizeof(info));
+    SNDFILE *sf = sf_open(path, SFM_READ, &info);
+    if (!sf) {
+        fprintf(stderr, "libsndfile: cannot open %s: %s\n", path, sf_strerror(NULL));
+        return NULL;
+    }
+    int ch = info.channels, sr = info.samplerate;
+    if (ch < 1 || sr < 1 || info.frames <= 0) { sf_close(sf); return NULL; }
+    float *inter = (float *)malloc((size_t)info.frames * ch * sizeof(float));
+    if (!inter) { sf_close(sf); return NULL; }
+    sf_count_t got = sf_readf_float(sf, inter, info.frames);  /* normalized to [-1,1] */
+    sf_close(sf);
+    if (got <= 0) { free(inter); return NULL; }
+    int n = (int)got;
+
+    size_t data_size = (size_t)n * 2;                /* mono, 16-bit */
+    uint8_t *wav = (uint8_t *)malloc(44 + data_size);
+    if (!wav) { free(inter); return NULL; }
+    uint32_t riff = (uint32_t)(36 + data_size), fmtsz = 16, srate = (uint32_t)sr,
+             byterate = (uint32_t)sr * 2, dsz = (uint32_t)data_size;
+    uint16_t pcm = 1, mono = 1, ba = 2, bits = 16;
+    memcpy(wav,    "RIFF", 4);  memcpy(wav + 4,  &riff, 4);
+    memcpy(wav + 8,"WAVE", 4);  memcpy(wav + 12, "fmt ", 4); memcpy(wav + 16, &fmtsz, 4);
+    memcpy(wav + 20, &pcm, 2);  memcpy(wav + 22, &mono, 2);  memcpy(wav + 24, &srate, 4);
+    memcpy(wav + 28, &byterate, 4); memcpy(wav + 32, &ba, 2); memcpy(wav + 34, &bits, 2);
+    memcpy(wav + 36, "data", 4); memcpy(wav + 40, &dsz, 4);
+    int16_t *pcmout = (int16_t *)(wav + 44);
+    for (int i = 0; i < n; i++) {
+        float s = inter[i * ch];                     /* downmix channels to mono */
+        for (int c = 1; c < ch; c++) s += inter[(size_t)i * ch + c];
+        s = (ch > 1 ? s / ch : s) * 32767.0f;
+        if (s > 32767.0f) s = 32767.0f;
+        if (s < -32768.0f) s = -32768.0f;
+        pcmout[i] = (int16_t)lrintf(s);
+    }
+    free(inter);
+    float *samples = qwen_parse_wav_buffer(wav, 44 + data_size, out_n_samples);
+    free(wav);
+    return samples;
+}
+#endif /* HAVE_SNDFILE */
+
 float *qwen_load_wav(const char *path, int *out_n_samples) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "qwen_load_wav: cannot open %s\n", path);
         return NULL;
     }
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    if (file_size <= 0) { fclose(f); return NULL; }
-    fseek(f, 0, SEEK_SET);
-    uint8_t *data = (uint8_t *)malloc(file_size);
-    if (!data || fread(data, 1, file_size, f) != (size_t)file_size) {
-        fclose(f); free(data); return NULL;
+    /* Peek the header: RIFF/WAVE → fast WAV path; otherwise hand off to libsndfile. */
+    unsigned char magic[12] = {0};
+    size_t mg = fread(magic, 1, sizeof(magic), f);
+    int is_wav = (mg >= 12 && memcmp(magic, "RIFF", 4) == 0 && memcmp(magic + 8, "WAVE", 4) == 0);
+
+    if (is_wav) {
+        fseek(f, 0, SEEK_END);
+        long file_size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (file_size <= 0) { fclose(f); return NULL; }
+        uint8_t *data = (uint8_t *)malloc(file_size);
+        if (!data || fread(data, 1, file_size, f) != (size_t)file_size) {
+            fclose(f); free(data); return NULL;
+        }
+        fclose(f);
+        float *samples = qwen_parse_wav_buffer(data, (size_t)file_size, out_n_samples);
+        free(data);
+        return samples;
     }
     fclose(f);
-    float *samples = qwen_parse_wav_buffer(data, (size_t)file_size, out_n_samples);
-    free(data);
-    return samples;
+#ifdef HAVE_SNDFILE
+    return load_via_sndfile(path, out_n_samples);     /* opus / ogg / flac / mp3 / ... */
+#else
+    fprintf(stderr, "qwen_load_wav: %s is not a WAV file "
+                    "(rebuild with libsndfile for opus/ogg/flac/mp3 support)\n", path);
+    return NULL;
+#endif
 }
 
 float *qwen_read_pcm_stdin(int *out_n_samples) {

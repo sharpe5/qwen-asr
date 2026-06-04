@@ -2,8 +2,17 @@
 # Makefile
 
 CC = zig cc
-CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math -Wno-date-time
-LDFLAGS = -lm -lpthread
+
+# libsndfile (optional): enables native -i decode of opus/ogg/flac/mp3.
+# Auto-detected via Homebrew; if absent, the build still works (WAV/stdin only).
+SNDFILE_PREFIX := $(shell brew --prefix libsndfile 2>/dev/null)
+ifneq ($(wildcard $(SNDFILE_PREFIX)/include/sndfile.h),)
+  SNDFILE_CFLAGS := -I$(SNDFILE_PREFIX)/include -DHAVE_SNDFILE
+  SNDFILE_LIBS := -L$(SNDFILE_PREFIX)/lib -lsndfile
+endif
+
+CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math -Wno-date-time $(SNDFILE_CFLAGS)
+LDFLAGS = -lm -lpthread $(SNDFILE_LIBS)
 
 # Platform detection
 UNAME_S := $(shell uname -s)
@@ -62,7 +71,7 @@ blas:
 GPU_OBJ = coreml_decoder.o
 ifeq ($(UNAME_S),Darwin)
 gpu: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -DQWEN_GPU
-gpu: LDFLAGS = -lm -lpthread -framework Accelerate -framework CoreML -framework Foundation -lobjc -lc++
+gpu: LDFLAGS = -lm -lpthread -framework Accelerate -framework CoreML -framework Foundation -lobjc -lc++ $(SNDFILE_LIBS)
 gpu:
 	@$(MAKE) clean
 	@$(MAKE) gpu_link CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
@@ -89,11 +98,14 @@ $(TARGET): $(OBJS) main.o
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Debug build
+# NOTE: built with Apple clang, not `zig cc` — zig cc instruments for ASan but
+# does not ship the ASan runtime, so linking fails with undefined ___asan_* symbols.
+debug: CC = clang
 debug: CFLAGS = $(DEBUG_CFLAGS)
 debug: LDFLAGS += -fsanitize=address
 debug:
 	@$(MAKE) clean
-	@$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
+	@$(MAKE) $(TARGET) CC="$(CC)" CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
 
 # =============================================================================
 # Utilities
