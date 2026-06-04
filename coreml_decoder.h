@@ -55,13 +55,15 @@ int gpu_decb_batch(void);    /* fixed batch size B baked into the model */
 int gpu_decb_reset(void);    /* fresh zeroed KV cache for all B lanes */
 
 /* Batched prefill: lane b feeds emb[b, 0..lens[b]-1] at positions 0..lens[b]-1.
- *   emb:      [B * Lmax * hidden]  per-lane prompt embeds, padded to Lmax (row-major)
- *   lens:     [B]                  real prompt length per lane (1..Lmax)
- *   Lmax:     max prompt length in the batch (1..gpu_dec_max())
- *   cos,sin:  [Lmax * head_dim]    RoPE for positions 0..Lmax-1 (shared across lanes)
- *   out_tok:  [B]                  greedy token at each lane's last real position
+ *   emb:        [B * Lmax * hidden]  per-lane prompt embeds, padded to Lmax (row-major)
+ *   lens:       [B]                  real prompt length per lane (1..Lmax)
+ *   write_lane: [B] or NULL          1=prefill this lane, 0=PRESERVE its KV (refill of
+ *                                    freed lanes mid-stream); NULL = all lanes prefill.
+ *   Lmax:       max prompt length over written lanes (1..gpu_dec_max())
+ *   cos,sin:    [Lmax * head_dim]    RoPE for positions 0..Lmax-1 (shared across lanes)
+ *   out_tok:    [B]                  greedy token at each written lane's last real position
  * Returns 0 on success. */
-int gpu_decb_prefill(const float *emb, const int *lens, int Lmax,
+int gpu_decb_prefill(const float *emb, const int *lens, const int *write_lane, int Lmax,
                      const float *cos, const float *sin, int *out_tok);
 
 /* Batched decode step (S=1): lane b feeds emb[b] at write position positions[b].

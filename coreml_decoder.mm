@@ -198,7 +198,7 @@ static int read_tok(id<MLFeatureProvider> result, int *dst, int b, int S, int co
     return 0;
 }
 
-int gpu_decb_prefill(const float *emb, const int *lens, int Lmax,
+int gpu_decb_prefill(const float *emb, const int *lens, const int *write_lane, int Lmax,
                      const float *cosv, const float *sinv, int *out_tok) {
     @autoreleasepool {
         if (!g_modelb || Lmax < 1 || Lmax > MAXLEN) return 1;
@@ -222,12 +222,17 @@ int gpu_decb_prefill(const float *emb, const int *lens, int Lmax,
         float *pa = (float *)amask.dataPointer;       /* [B,1,Lmax,MAXLEN] */
         memset(pw, 0, (size_t)B * MAXLEN * Lmax * sizeof(float));
         for (int b = 0; b < B; b++) {
+            int wr = write_lane ? write_lane[b] : 1;              /* 0 => preserve this lane's KV */
             int L = lens[b]; if (L < 1) L = 1; if (L > Lmax) L = Lmax;
-            for (int p = 0; p < L; p++)
-                pw[((size_t)b * MAXLEN + p) * Lmax + p] = 1.0f;   /* write real positions */
+            if (wr) {
+                for (int p = 0; p < L; p++)
+                    pw[((size_t)b * MAXLEN + p) * Lmax + p] = 1.0f;   /* write real positions */
+            }
             for (int s = 0; s < Lmax; s++) {
                 float *row = pa + ((size_t)b * Lmax + s) * MAXLEN;
-                int lim = (s < L) ? s : (L - 1);                  /* causal; pad rows -> all real keys */
+                /* causal for written lanes; preserve-lanes attend only pos0 (output discarded,
+                 * no NaN). wmask=0 for preserve lanes => their KV state is untouched. */
+                int lim = wr ? ((s < L) ? s : (L - 1)) : 0;
                 for (int j = 0; j < MAXLEN; j++) row[j] = (j <= lim) ? 0.0f : -1e9f;
             }
         }
