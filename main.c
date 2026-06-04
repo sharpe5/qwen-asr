@@ -46,7 +46,7 @@ static int parse_past_text_mode(const char *s, int *out_mode) {
 }
 
 static void usage(const char *prog) {
-    fprintf(stderr, "qwen_asr — Qwen3-ASR speech-to-text (pure C)\n\n");
+    fprintf(stderr, "qwen_asr — Qwen3-ASR speech-to-text (pure C) [build %s]\n\n", __DATE__);
     fprintf(stderr, "Usage: %s -d <model_dir> (-i <input.wav> | --stdin) [options]\n\n", prog);
     fprintf(stderr, "Required:\n");
     fprintf(stderr, "  -d <dir>      Model directory (with *.safetensors, vocab.json)\n");
