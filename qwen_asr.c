@@ -907,15 +907,15 @@ static char *json_build(const char *full_text, const char *segs_inner) {
 }
 
 /* ========================================================================
- * Lever 1: pipelined GPU segmented decode
+ * GPU encode→decode FIFO (used by the batched scheduler below)
  * ------------------------------------------------------------------------
- * A producer thread runs mel + encoder (CPU; BLAS/Accelerate — disjoint from
- * the decoder's `tp` threadpool and from the GPU/CoreML state) for each segment
- * into a bounded FIFO; the consumer (caller thread) prefills + decodes each on
- * the GPU. Encode of segment N+1 overlaps decode of segment N, hiding the CPU
- * encode behind the longer GPU decode. Only used for --gpu, where past_text=no
- * makes segments independent (no cross-segment state), so the producer never
- * touches mutable decoder state and only the queue needs synchronisation.
+ * Producer thread(s) run mel + encoder on the CPU (BLAS/Accelerate — disjoint
+ * from the decoder's `tp` threadpool and the GPU/CoreML state) for each segment
+ * into this bounded FIFO; the consumer pulls encoded segments and decodes them
+ * on the GPU, so encode overlaps decode. --past-text no makes segments
+ * independent, so the producer never touches mutable decoder state — only the
+ * queue needs synchronisation. Items carry seg_idx because parallel encode
+ * workers complete out of order; the consumer reassembles by index.
  * ======================================================================== */
 
 static int stream_encode_span(qwen_ctx_t *ctx, const float *samples, int n_samples,
@@ -937,198 +937,6 @@ typedef struct {
     pthread_cond_t not_full, not_empty;
 } enc_pipe_t;
 
-typedef struct {
-    qwen_ctx_t *ctx;
-    const float *audio_samples;
-    const int *splits;
-    int n_splits;
-    int min_samples;
-    enc_pipe_t *pipe;
-} enc_producer_args_t;
-
-static void *enc_producer(void *argp) {
-    enc_producer_args_t *pa = (enc_producer_args_t *)argp;
-    enc_pipe_t *q = pa->pipe;
-    for (int s = 0; s < pa->n_splits; s++) {
-        int core_start = pa->splits[s];
-        int core_end = pa->splits[s + 1];
-        int seg_samples = core_end - core_start;
-        const float *seg_ptr = pa->audio_samples + core_start;
-        float *seg_buf = NULL;
-        if (seg_samples < pa->min_samples) {
-            seg_buf = (float *)calloc(pa->min_samples, sizeof(float));
-            if (seg_buf) {
-                memcpy(seg_buf, seg_ptr, (size_t)seg_samples * sizeof(float));
-                seg_ptr = seg_buf;
-                seg_samples = pa->min_samples;
-            }
-        }
-
-        double t0 = get_time_ms();
-        float *enc_output = NULL;
-        int enc_seq_len = 0;
-        if (stream_encode_span(pa->ctx, seg_ptr, seg_samples, &enc_output, &enc_seq_len) != 0)
-            enc_output = NULL;
-        double enc_ms = get_time_ms() - t0;
-        free(seg_buf);
-
-        pthread_mutex_lock(&q->mtx);
-        while (q->count == q->cap) pthread_cond_wait(&q->not_full, &q->mtx);
-        enc_pipe_item_t *it = &q->slots[q->tail];
-        it->seg_idx = s;
-        it->core_start = core_start;
-        it->core_end = core_end;
-        it->enc_output = enc_output;
-        it->enc_seq_len = enc_seq_len;
-        it->enc_ms = enc_ms;
-        q->tail = (q->tail + 1) % q->cap;
-        q->count++;
-        pthread_cond_signal(&q->not_empty);
-        pthread_mutex_unlock(&q->mtx);
-    }
-    pthread_mutex_lock(&q->mtx);
-    q->closed = 1;
-    pthread_cond_broadcast(&q->not_empty);
-    pthread_mutex_unlock(&q->mtx);
-    return NULL;
-}
-
-/* Append a finished segment transcript to the running result (and JSON segs).
- * Live token emission already happened during decode via segment_emit_cb, so we
- * only grow `result` here (mirrors the serial fast-emit path). */
-static void pipe_append_segment(qwen_ctx_t *ctx, char *seg_text,
-                                int core_start, int core_end,
-                                char **result, size_t *result_len, size_t *result_cap,
-                                char **segs, size_t *segs_len, size_t *segs_cap) {
-    if (!seg_text || seg_text[0] == '\0') return;
-    size_t add_len = strlen(seg_text);
-    int need_space = should_insert_boundary_space(
-        *result_len > 0 ? (int)(unsigned char)(*result)[*result_len - 1] : 0,
-        (int)(unsigned char)seg_text[0]);
-    size_t need = *result_len + add_len + (size_t)(need_space ? 2 : 1);
-    if (need > *result_cap) {
-        while (need > *result_cap) *result_cap *= 2;
-        *result = (char *)realloc(*result, *result_cap);
-    }
-    if (need_space) (*result)[(*result_len)++] = ' ';
-    memcpy(*result + *result_len, seg_text, add_len);
-    *result_len += add_len;
-    (*result)[*result_len] = '\0';
-    if (ctx->emit_json)
-        json_seg_append(segs, segs_len, segs_cap, core_start, core_end, seg_text);
-}
-
-static char *transcribe_segments_gpu_pipelined(qwen_ctx_t *ctx, const float *audio_samples,
-                                               const int *splits, int n_splits,
-                                               int min_samples, qwen_tokenizer_t *tokenizer) {
-    enc_pipe_t pipe;
-    pipe.cap = 4;
-    pipe.slots = (enc_pipe_item_t *)calloc((size_t)pipe.cap, sizeof(enc_pipe_item_t));
-    pipe.head = pipe.tail = pipe.count = 0;
-    pipe.closed = 0;
-    pthread_mutex_init(&pipe.mtx, NULL);
-    pthread_cond_init(&pipe.not_full, NULL);
-    pthread_cond_init(&pipe.not_empty, NULL);
-
-    enc_producer_args_t pa = { ctx, audio_samples, splits, n_splits, min_samples, &pipe };
-    pthread_t prod;
-    int threaded = (pipe.slots != NULL && pthread_create(&prod, NULL, enc_producer, &pa) == 0);
-
-    size_t result_cap = 4096, result_len = 0;
-    char *result = (char *)malloc(result_cap);
-    result[0] = '\0';
-    char *segs = NULL; size_t segs_len = 0, segs_cap = 0;
-    if (ctx->emit_json) { segs_cap = 4096; segs = (char *)malloc(segs_cap); segs[0] = '\0'; }
-    qwen_token_cb saved_cb = ctx->token_cb;
-    void *saved_cb_userdata = ctx->token_cb_userdata;
-
-    if (!threaded) {
-        /* Fallback: no producer thread — encode + decode serially in order. */
-        for (int s = 0; s < n_splits; s++) {
-            int core_start = splits[s], core_end = splits[s + 1];
-            int seg_samples = core_end - core_start;
-            const float *seg_ptr = audio_samples + core_start;
-            float *seg_buf = NULL;
-            if (seg_samples < min_samples) {
-                seg_buf = (float *)calloc(min_samples, sizeof(float));
-                if (seg_buf) { memcpy(seg_buf, seg_ptr, (size_t)seg_samples * sizeof(float));
-                               seg_ptr = seg_buf; seg_samples = min_samples; }
-            }
-            double t0 = get_time_ms();
-            float *enc_output = NULL; int enc_seq_len = 0;
-            if (stream_encode_span(ctx, seg_ptr, seg_samples, &enc_output, &enc_seq_len) != 0)
-                enc_output = NULL;
-            ctx->perf_encode_ms += get_time_ms() - t0;
-            free(seg_buf);
-            if (!enc_output || enc_seq_len <= 0) { free(enc_output); continue; }
-
-            segment_emit_state_t emit_state = {0};
-            if (saved_cb) {
-                emit_state.downstream_cb = saved_cb;
-                emit_state.downstream_userdata = saved_cb_userdata;
-                emit_state.maybe_prepend_space =
-                    (result_len > 0 && !isspace((unsigned char)result[result_len - 1]));
-                ctx->token_cb = segment_emit_cb;
-                ctx->token_cb_userdata = &emit_state;
-            }
-            char *seg_text = decode_segment_from_enc(ctx, enc_output, enc_seq_len,
-                                                     tokenizer, NULL, 0, NULL);
-            ctx->token_cb = saved_cb; ctx->token_cb_userdata = saved_cb_userdata;
-            pipe_append_segment(ctx, seg_text, core_start, core_end,
-                                &result, &result_len, &result_cap,
-                                &segs, &segs_len, &segs_cap);
-            free(seg_text);
-        }
-    } else {
-        for (;;) {
-            pthread_mutex_lock(&pipe.mtx);
-            while (pipe.count == 0 && !pipe.closed)
-                pthread_cond_wait(&pipe.not_empty, &pipe.mtx);
-            if (pipe.count == 0 && pipe.closed) { pthread_mutex_unlock(&pipe.mtx); break; }
-            enc_pipe_item_t it = pipe.slots[pipe.head];
-            pipe.head = (pipe.head + 1) % pipe.cap;
-            pipe.count--;
-            pthread_cond_signal(&pipe.not_full);
-            pthread_mutex_unlock(&pipe.mtx);
-
-            ctx->perf_encode_ms += it.enc_ms;
-            if (!it.enc_output || it.enc_seq_len <= 0) { free(it.enc_output); continue; }
-
-            segment_emit_state_t emit_state = {0};
-            if (saved_cb) {
-                emit_state.downstream_cb = saved_cb;
-                emit_state.downstream_userdata = saved_cb_userdata;
-                emit_state.maybe_prepend_space =
-                    (result_len > 0 && !isspace((unsigned char)result[result_len - 1]));
-                ctx->token_cb = segment_emit_cb;
-                ctx->token_cb_userdata = &emit_state;
-            }
-            char *seg_text = decode_segment_from_enc(ctx, it.enc_output, it.enc_seq_len,
-                                                     tokenizer, NULL, 0, NULL);
-            ctx->token_cb = saved_cb; ctx->token_cb_userdata = saved_cb_userdata;
-            pipe_append_segment(ctx, seg_text, it.core_start, it.core_end,
-                                &result, &result_len, &result_cap,
-                                &segs, &segs_len, &segs_cap);
-            free(seg_text);
-        }
-        pthread_join(prod, NULL);
-    }
-
-    ctx->token_cb = saved_cb;
-    ctx->token_cb_userdata = saved_cb_userdata;
-    pthread_mutex_destroy(&pipe.mtx);
-    pthread_cond_destroy(&pipe.not_full);
-    pthread_cond_destroy(&pipe.not_empty);
-    free(pipe.slots);
-
-    if (ctx->emit_json) {
-        char *json = json_build(result, segs ? segs : "");
-        free(segs);
-        free(result);
-        return json;
-    }
-    return result;
-}
 
 #ifdef QWEN_GPU
 /* ========================================================================
@@ -1253,10 +1061,15 @@ static char *transcribe_segments_gpu_batched(qwen_ctx_t *ctx, const float *audio
     pthread_mutex_init(&pipe.mtx, NULL);
     pthread_cond_init(&pipe.not_full, NULL); pthread_cond_init(&pipe.not_empty, NULL);
 
-    /* parallel encode workers (feed B lanes fast enough to avoid ramp-up stalls) */
+    /* parallel encode workers (feed B lanes fast enough to avoid ramp-up stalls).
+     * Source: CLI (cfg->gpu_enc_threads) > env (back-compat) > default 4. */
     int n_enc = 4;
-    const char *et = getenv("QWEN_GPU_ENC_THREADS");
-    if (et) n_enc = atoi(et);
+    if (cfg->gpu_enc_threads > 0) {
+        n_enc = cfg->gpu_enc_threads;
+    } else {
+        const char *et = getenv("QWEN_GPU_ENC_THREADS");
+        if (et) n_enc = atoi(et);
+    }
     if (n_enc < 1) n_enc = 1;
     if (n_enc > n_splits) n_enc = n_splits;
     if (n_enc > 16) n_enc = 16;
@@ -1305,10 +1118,16 @@ static char *transcribe_segments_gpu_batched(qwen_ctx_t *ctx, const float *audio
     int n_pulled = 0, n_done = 0;
     double decode_ms = 0.0;
     /* refill only when >= refill_min lanes are free, so each dense B-lane prefill
-     * amortizes over many lanes (a single-lane refill costs ~a full prefill). */
-    int refill_min = (B + 1) / 2; if (refill_min < 1) refill_min = 1;
-    const char *rm = getenv("QWEN_GPU_REFILL_MIN");
-    if (rm) { refill_min = atoi(rm); if (refill_min < 1) refill_min = 1; if (refill_min > B) refill_min = B; }
+     * amortizes over many lanes. Source: CLI (cfg->gpu_refill_min) > env > default 3. */
+    int refill_min = 3;
+    if (cfg->gpu_refill_min > 0) {
+        refill_min = cfg->gpu_refill_min;
+    } else {
+        const char *rm = getenv("QWEN_GPU_REFILL_MIN");
+        if (rm) refill_min = atoi(rm);
+    }
+    if (refill_min < 1) refill_min = 1;
+    if (refill_min > B) refill_min = B;
 
     while (n_done < n_splits) {
         /* ---- A. fill free lanes from available encoded segments (batched refill) ---- */
@@ -1528,8 +1347,11 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
     int target_samples = (int)(ctx->segment_sec * QWEN_SAMPLE_RATE);
     int margin_samples = (int)(search * QWEN_SAMPLE_RATE);
 
-    /* No splitting if segment_sec is 0 or audio fits in one segment */
-    if (ctx->segment_sec <= 0 || audio_n_samples <= target_samples + margin_samples) {
+    /* No splitting if segment_sec is 0 or audio fits in one segment.
+     * The GPU path always routes through the batched scheduler below (it decodes a
+     * single segment as one active lane), so this CPU-only shortcut is skipped for --gpu. */
+    if (!ctx->config.use_gpu &&
+        (ctx->segment_sec <= 0 || audio_n_samples <= target_samples + margin_samples)) {
         char *text = transcribe_segment(ctx, audio_samples, audio_n_samples, tokenizer, NULL, 0, NULL);
         qwen_tokenizer_free(tokenizer);
         free(compacted_samples);
@@ -1562,9 +1384,10 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
         fprintf(stderr, "Splitting into %d segments\n", n_splits);
 
 #ifdef QWEN_GPU
-    if (ctx->config.use_gpu && gpu_decb_ready() && !getenv("QWEN_GPU_NO_BATCH")) {
-        /* Lever 3: batched GPU decode (B independent segments per forward),
-         * with encode still pipelined ahead. (QWEN_GPU_NO_BATCH=1 -> Lever 1.) */
+    if (ctx->config.use_gpu) {
+        /* All --gpu decode goes through the single batched B-lane model, which
+         * handles n_splits>=1 (a single short segment runs as one active lane,
+         * the rest padded inert). Encode is pipelined ahead inside the scheduler. */
         int min_samples = QWEN_SAMPLE_RATE / 2;
         double bt0 = get_time_ms();
         char *gpu_result = transcribe_segments_gpu_batched(
@@ -1575,20 +1398,6 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
         return gpu_result;
     }
 #endif
-    if (ctx->config.use_gpu && !getenv("QWEN_GPU_NO_PIPELINE")) {
-        /* Lever 1: pipeline CPU encode behind GPU decode. Segments are
-         * independent under --gpu (past_text=no), so encode of seg N+1 can
-         * run on a CPU thread while seg N decodes on the GPU.
-         * (QWEN_GPU_NO_PIPELINE=1 falls back to the serial loop for A/B.) */
-        int min_samples = QWEN_SAMPLE_RATE / 2;
-        double pipe_t0 = get_time_ms();
-        char *gpu_result = transcribe_segments_gpu_pipelined(
-            ctx, audio_samples, splits, n_splits, min_samples, tokenizer);
-        ctx->perf_total_ms += get_time_ms() - pipe_t0;
-        qwen_tokenizer_free(tokenizer);
-        free(compacted_samples);
-        return gpu_result;
-    }
 
     /* Transcribe each segment and concatenate */
     size_t result_cap = 4096;

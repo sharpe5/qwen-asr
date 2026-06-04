@@ -71,6 +71,8 @@ typedef struct {
      * (coreml_decoder.mm). Requires the `gpu` build + qwen_decoder_gpu.mlpackage.
      * Only valid with independent chunks (past_text == no). */
     int use_gpu;               /* 0 = CPU (default), 1 = CoreML GPU decoder */
+    int gpu_refill_min;        /* 0 = auto/default(3); else batched refill threshold (clamped 1..B) */
+    int gpu_enc_threads;       /* 0 = auto/default(4); else encode worker count (clamped 1..16) */
 } qwen_config_t;
 
 /* ========================================================================

@@ -29,6 +29,10 @@ static int parse_string(const char **p, char *out, size_t max_len) {
     while (**p && **p != '"' && i < max_len - 1) {
         if (**p == '\\') {
             (*p)++;
+            /* A trailing backslash at the end of the (NUL-terminated) header
+             * buffer must not be consumed as an escape, or the loop walks past
+             * the terminator and reads out of bounds. Bail as malformed. */
+            if (**p == '\0') break;
             if (**p == 'n') out[i++] = '\n';
             else if (**p == 't') out[i++] = '\t';
             else if (**p == '"') out[i++] = '"';
@@ -51,7 +55,11 @@ static int64_t parse_int(const char **p) {
     int neg = 0;
     if (**p == '-') { neg = 1; (*p)++; }
     while (**p >= '0' && **p <= '9') {
-        val = val * 10 + (**p - '0');
+        int d = **p - '0';
+        /* Saturate instead of overflowing (signed overflow is UB); an absurd
+         * value is rejected later by the bounds checks in safetensors_open(). */
+        if (val > (INT64_MAX - d) / 10) val = INT64_MAX;
+        else val = val * 10 + d;
         (*p)++;
     }
     return neg ? -val : val;
@@ -224,6 +232,36 @@ safetensors_file_t *safetensors_open(const char *path) {
 
     if (parse_header(sf) != 0) { safetensors_close(sf); return NULL; }
 
+    /* Validate every tensor against a hostile/corrupt header so the accessors
+     * below cannot read or allocate out of bounds:
+     *   - [data_offset, data_offset+data_size) must lie within the data region;
+     *   - the element count must not overflow; and
+     *   - numel*element_size must fit within data_size (bounds get_f32's read
+     *     and its numel*sizeof(float) allocation by the on-disk byte span). */
+    size_t data_region = file_size - 8 - (size_t)header_size;
+    for (int i = 0; i < sf->num_tensors; i++) {
+        const safetensor_t *t = &sf->tensors[i];
+        if (t->data_offset > data_region ||
+            t->data_size   > data_region - t->data_offset) {
+            safetensors_close(sf); return NULL;
+        }
+        int64_t numel = 1;
+        for (int d = 0; d < t->ndim; d++) {
+            if (t->shape[d] < 0 ||
+                (t->shape[d] != 0 && numel > INT64_MAX / t->shape[d])) {
+                safetensors_close(sf); return NULL;
+            }
+            numel *= t->shape[d];
+        }
+        size_t elem = (t->dtype == DTYPE_F32 || t->dtype == DTYPE_I32) ? 4 :
+                      (t->dtype == DTYPE_I64)                          ? 8 :
+                      (t->dtype == DTYPE_F16 || t->dtype == DTYPE_BF16)? 2 :
+                      (t->dtype == DTYPE_BOOL)                         ? 1 : 0;
+        if (elem && (uint64_t)numel * elem > t->data_size) {
+            safetensors_close(sf); return NULL;
+        }
+    }
+
     return sf;
 }
 
@@ -253,6 +291,11 @@ static float bf16_to_f32(uint16_t bf16) {
 }
 
 float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) {
+    /* Reject unsupported dtypes before allocating: otherwise a huge shape on an
+     * unknown-dtype tensor (whose byte span open-time validation can't bound)
+     * would drive a numel*sizeof(float) allocation before the switch rejects it. */
+    if (t->dtype != DTYPE_F32 && t->dtype != DTYPE_BF16) return NULL;
+
     int64_t n = safetensor_numel(t);
     if (n <= 0) return NULL;
 

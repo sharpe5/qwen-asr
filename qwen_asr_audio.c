@@ -38,8 +38,9 @@
  * WAV File Loading (adapted from voxtral)
  * ======================================================================== */
 
-static uint16_t read_u16(const uint8_t *p) { return p[0] | (p[1] << 8); }
-static uint32_t read_u32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24); }
+/* Shift in uint32_t: p[3] would promote to int, so p[3]<<24 overflows signed int (UB). */
+static uint16_t read_u16(const uint8_t *p) { return (uint16_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8)); }
+static uint32_t read_u32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 
 float *qwen_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_samples) {
     if (file_size < 44 || memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) {
@@ -72,9 +73,9 @@ float *qwen_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_s
         if (chunk_size & 1) p++;
     }
 
-    if (audio_format != 1 || bits_per_sample != 16 || pcm_data == NULL || channels < 1) {
-        fprintf(stderr, "parse_wav_buffer: unsupported format (need 16-bit PCM, got fmt=%d bits=%d)\n",
-                audio_format, bits_per_sample);
+    if (audio_format != 1 || bits_per_sample != 16 || pcm_data == NULL || channels < 1 || sample_rate < 1) {
+        fprintf(stderr, "parse_wav_buffer: unsupported format (need 16-bit PCM, got fmt=%d bits=%d rate=%d ch=%d)\n",
+                audio_format, bits_per_sample, sample_rate, channels);
         return NULL;
     }
 

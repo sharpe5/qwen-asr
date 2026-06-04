@@ -14,6 +14,30 @@
 
 #ifdef QWEN_GPU
 #include "coreml_decoder.h"   /* GPU fast path (CoreML); only in the `gpu` build */
+#include <libgen.h>           /* dirname */
+#include <unistd.h>           /* access  */
+#include <limits.h>           /* PATH_MAX */
+
+/* Resolve a bare .mlpackage filename to a path that works regardless of cwd:
+ *   --gpu-model-dir override, else the executable's own directory (from argv[0]),
+ *   else the bare name (cwd-relative fallback). Writes into out (size n). */
+static const char *resolve_gpu_model(char *out, size_t n, const char *prog,
+                                     const char *model_dir_override, const char *filename) {
+    if (model_dir_override && model_dir_override[0]) {
+        snprintf(out, n, "%s/%s", model_dir_override, filename);
+        return out;
+    }
+    char rp[PATH_MAX];
+    if (realpath(prog, rp)) {
+        char tmp[PATH_MAX];
+        snprintf(tmp, sizeof(tmp), "%s", rp);
+        char *dir = dirname(tmp);          /* dirname may mutate tmp; use the return value now */
+        snprintf(out, n, "%s/%s", dir, filename);
+        if (access(out, F_OK) == 0) return out;
+    }
+    snprintf(out, n, "%s", filename);      /* cwd-relative fallback */
+    return out;
+}
 #endif
 
 /* Token streaming callback: print each piece as it's decoded */
@@ -76,8 +100,17 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --debug       Debug output (per-layer details)\n");
     fprintf(stderr, "  --silent      No status output (only final transcription on stdout)\n");
     fprintf(stderr, "                 with -i + --stream, uses non-interactive final refinement\n");
-    fprintf(stderr, "  --gpu         Run the decoder on the GPU via CoreML (needs `make gpu` +\n");
-    fprintf(stderr, "                qwen_decoder_gpu.mlpackage; segmented, --past-text no only; 0.6B)\n");
+    fprintf(stderr, "  --gpu         Run the decoder on the GPU via CoreML (needs `make gpu`;\n");
+    fprintf(stderr, "                segmented, --past-text no only; 0.6B). Auto-loads\n");
+    fprintf(stderr, "                qwen_decoder_gpu_b4_hidden.mlpackage from the executable's dir.\n");
+    fprintf(stderr, "  --profile <throughput>   GPU preset (with --gpu): lean encode for many\n");
+    fprintf(stderr, "                           concurrent processes (enc-threads 1).\n");
+    fprintf(stderr, "  --gpu-model-dir <dir>    Directory holding the .mlpackage (default: exe dir)\n");
+    fprintf(stderr, "  --gpu-model <path>       Explicit .mlpackage path (overrides the default)\n");
+    fprintf(stderr, "  --gpu-refill-min <n>     Batched refill threshold 1..B (default 3)\n");
+    fprintf(stderr, "  --gpu-enc-threads <n>    Encode worker threads 1..16 (default 4)\n");
+    fprintf(stderr, "  GPU throughput example (run several in parallel, one file each):\n");
+    fprintf(stderr, "    %s -d <model_dir> -i file.opus --gpu --profile throughput -t 2 --silent\n", prog);
     fprintf(stderr, "  -h            Show this help\n");
 }
 
@@ -99,6 +132,11 @@ int main(int argc, char **argv) {
     int json_output = 0;
     int emit_tokens = 1;
     int use_gpu = 0;
+    const char *profile = NULL;          /* --profile throughput */
+    const char *gpu_model_dir = NULL;    /* --gpu-model-dir <dir> */
+    const char *gpu_model_flag = NULL;   /* --gpu-model <path> override */
+    int gpu_refill_min = 0;              /* --gpu-refill-min (0 = auto) */
+    int gpu_enc_threads = 0;             /* --gpu-enc-threads (0 = auto) */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
@@ -144,6 +182,16 @@ int main(int argc, char **argv) {
             verbosity = 0;
         } else if (strcmp(argv[i], "--gpu") == 0) {
             use_gpu = 1;
+        } else if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) {
+            profile = argv[++i];
+        } else if (strcmp(argv[i], "--gpu-model-dir") == 0 && i + 1 < argc) {
+            gpu_model_dir = argv[++i];
+        } else if (strcmp(argv[i], "--gpu-model") == 0 && i + 1 < argc) {
+            gpu_model_flag = argv[++i];
+        } else if (strcmp(argv[i], "--gpu-refill-min") == 0 && i + 1 < argc) {
+            gpu_refill_min = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--gpu-enc-threads") == 0 && i + 1 < argc) {
+            gpu_enc_threads = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -168,6 +216,14 @@ int main(int argc, char **argv) {
     }
     if (input_wav && use_stdin) {
         fprintf(stderr, "Error: -i and --stdin are mutually exclusive\n");
+        return 1;
+    }
+    if (profile && strcmp(profile, "throughput") != 0) {
+        fprintf(stderr, "Error: --profile must be 'throughput' (got '%s')\n", profile);
+        return 1;
+    }
+    if ((profile || gpu_model_dir || gpu_model_flag || gpu_refill_min || gpu_enc_threads) && !use_gpu) {
+        fprintf(stderr, "Error: --profile / --gpu-* options require --gpu\n");
         return 1;
     }
 
@@ -227,27 +283,32 @@ int main(int argc, char **argv) {
                             "(engine hidden=%d, gpu=%d)\n", ctx->config.dec_hidden, gpu_dec_hidden());
             qwen_free(ctx); return 1;
         }
-        const char *mpath = getenv("QWEN_GPU_MODEL");
-        if (!mpath) mpath = "qwen_decoder_gpu.mlpackage";
-        if (gpu_dec_init(mpath) != 0) {
-            fprintf(stderr, "Error: failed to init GPU decoder from %s "
-                            "(set QWEN_GPU_MODEL to the .mlpackage path)\n", mpath);
+        /* One batched B-lane model serves all --gpu decode (handles 1..B segments).
+         * Path: --gpu-model > env (back-compat) > default resolved next to the binary. */
+        char mbuf[PATH_MAX];
+        const char *mpath = gpu_model_flag;
+        if (!mpath) mpath = getenv("QWEN_GPU_BATCH_MODEL");
+        if (!mpath) mpath = getenv("QWEN_GPU_MODEL");
+        if (!mpath)
+            mpath = resolve_gpu_model(mbuf, sizeof(mbuf), argv[0], gpu_model_dir,
+                                      "qwen_decoder_gpu_b4_hidden.mlpackage");
+        else if (!strchr(mpath, '/'))   /* bare filename from flag/env -> resolve like the default */
+            mpath = resolve_gpu_model(mbuf, sizeof(mbuf), argv[0], gpu_model_dir, mpath);
+        if (gpu_decb_init(mpath) != 0) {
+            fprintf(stderr, "Error: failed to load GPU model %s\n"
+                            "  (pass --gpu-model <path> or --gpu-model-dir <dir>)\n", mpath);
             qwen_free(ctx); return 1;
         }
         ctx->config.use_gpu = 1;
-        if (qwen_verbose > 0) fprintf(stderr, "GPU decoder enabled (CoreML CPU+GPU): %s\n", mpath);
-        /* Optional Lever 3: batched decode (B segments/forward, GPU lm_head+argmax).
-         * Opt-in via QWEN_GPU_BATCH_MODEL=<batched .mlpackage>; falls back to the
-         * pipelined single-lane path (Lever 1) if unset or load fails. */
-        const char *bpath = getenv("QWEN_GPU_BATCH_MODEL");
-        if (bpath) {
-            if (gpu_decb_init(bpath) != 0) {
-                fprintf(stderr, "Warning: batched GPU model %s failed to load; "
-                                "using pipelined single-lane decode\n", bpath);
-            } else if (qwen_verbose > 0) {
-                fprintf(stderr, "Batched GPU decode enabled (B=%d): %s\n", gpu_decb_batch(), bpath);
-            }
-        }
+        /* --profile throughput => lean encode for many concurrent processes.
+         * gpu_refill_min/enc_threads stay 0 (auto: refill 3, enc 4) unless set. */
+        if (profile && strcmp(profile, "throughput") == 0 && gpu_enc_threads == 0)
+            gpu_enc_threads = 1;
+        ctx->config.gpu_refill_min = gpu_refill_min;
+        ctx->config.gpu_enc_threads = gpu_enc_threads;
+        if (qwen_verbose > 0)
+            fprintf(stderr, "GPU decode enabled (CoreML, batched B=%d): %s\n",
+                    gpu_decb_batch(), mpath);
 #else
         fprintf(stderr, "Error: --gpu not available in this build; rebuild with `make gpu`\n");
         qwen_free(ctx); return 1;

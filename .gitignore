@@ -9,3 +9,14 @@ __pycache__/
 samples/extra
 Qwen3-ASR
 TODO.md
+
+# Fuzzing artifacts
+*.fuzz.o
+fuzz/fuzz_wav
+fuzz/fuzz_safetensors
+fuzz/corpus/
+fuzz/findings/
+
+# /ex-fuzz soak reports
+reports/
+fuzz/
