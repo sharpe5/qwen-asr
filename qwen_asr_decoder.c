@@ -259,6 +259,14 @@ static int ensure_rope_cache(qwen_ctx_t *ctx, int required_pos, int head_dim, fl
     return 0;
 }
 
+/* Public wrapper: ensure the decoder RoPE cache covers [0, n_positions). After
+ * this, ctx->rope_cache_cos/sin are valid as [pos, dec_head_dim] (NeoX layout).
+ * Used by the batched GPU path (Lever 3) which assembles per-lane RoPE in C. */
+int qwen_decoder_ensure_rope(qwen_ctx_t *ctx, int n_positions) {
+    return ensure_rope_cache(ctx, n_positions,
+                             ctx->config.dec_head_dim, ctx->config.dec_rope_theta);
+}
+
 /* ========================================================================
  * Decoder Prefill (Multiple Tokens)
  * ======================================================================== */

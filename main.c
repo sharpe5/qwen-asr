@@ -236,6 +236,18 @@ int main(int argc, char **argv) {
         }
         ctx->config.use_gpu = 1;
         if (qwen_verbose > 0) fprintf(stderr, "GPU decoder enabled (CoreML CPU+GPU): %s\n", mpath);
+        /* Optional Lever 3: batched decode (B segments/forward, GPU lm_head+argmax).
+         * Opt-in via QWEN_GPU_BATCH_MODEL=<batched .mlpackage>; falls back to the
+         * pipelined single-lane path (Lever 1) if unset or load fails. */
+        const char *bpath = getenv("QWEN_GPU_BATCH_MODEL");
+        if (bpath) {
+            if (gpu_decb_init(bpath) != 0) {
+                fprintf(stderr, "Warning: batched GPU model %s failed to load; "
+                                "using pipelined single-lane decode\n", bpath);
+            } else if (qwen_verbose > 0) {
+                fprintf(stderr, "Batched GPU decode enabled (B=%d): %s\n", gpu_decb_batch(), bpath);
+            }
+        }
 #else
         fprintf(stderr, "Error: --gpu not available in this build; rebuild with `make gpu`\n");
         qwen_free(ctx); return 1;

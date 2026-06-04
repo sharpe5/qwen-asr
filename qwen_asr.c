@@ -17,6 +17,10 @@
 #include <math.h>
 #include <limits.h>
 #include <sys/time.h>
+#include <pthread.h>
+#ifdef QWEN_GPU
+#include "coreml_decoder.h"   /* batched GPU decode (Lever 3): gpu_decb_* */
+#endif
 
 /* Global verbose flag */
 int qwen_verbose = 0;
@@ -588,120 +592,83 @@ static int find_split_point(const float *samples, int n_samples,
  * Transcribe a single audio segment. Returns malloc'd text or NULL.
  * The tokenizer is passed in so we only load it once.
  */
-static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
-                                int n_samples, qwen_tokenizer_t *tokenizer,
-                                const int *past_tokens, int n_past_tokens,
-                                int *out_text_tokens) {
+/* Assemble decoder input embeddings for one segment:
+ * [prefix_head][prompt][prefix_tail][encoder tokens][suffix_base][force-lang][past + <asr_text>].
+ * Takes ownership of enc_output (frees it). Returns malloc'd [total_seq, dim] (caller frees)
+ * and sets *out_total_seq, or NULL on failure. Caller must have run prepare_prompt_tokens. */
+static float *build_segment_input_embeds(qwen_ctx_t *ctx, float *enc_output, int enc_seq_len,
+                                         const int *past_tokens, int n_past_tokens,
+                                         int *out_total_seq) {
+    int dim = ctx->config.dec_hidden;
+    int prefix_len = PREFIX_HEAD_LEN + ctx->n_prompt_tokens + PREFIX_TAIL_LEN;
+    int suffix_len = SUFFIX_BASE_LEN + ctx->n_force_prompt_tokens;
+    int n_past_prompt_tokens = (n_past_tokens > 0) ? (n_past_tokens + 1) : 0; /* + <asr_text> */
+    int total_seq = prefix_len + enc_seq_len + suffix_len + n_past_prompt_tokens;
+    float *input_embeds = (float *)malloc((size_t)total_seq * dim * sizeof(float));
+    if (!input_embeds) { free(enc_output); return NULL; }
+
+    int off = 0;
+    for (int i = 0; i < PREFIX_HEAD_LEN; i++)
+        tok_embed_bf16_to_f32(input_embeds + (off++) * dim,
+                              ctx->decoder.tok_embeddings_bf16, PROMPT_PREFIX_HEAD[i], dim);
+    for (int i = 0; i < ctx->n_prompt_tokens; i++)
+        tok_embed_bf16_to_f32(input_embeds + (off++) * dim,
+                              ctx->decoder.tok_embeddings_bf16, ctx->prompt_tokens[i], dim);
+    for (int i = 0; i < PREFIX_TAIL_LEN; i++)
+        tok_embed_bf16_to_f32(input_embeds + (off++) * dim,
+                              ctx->decoder.tok_embeddings_bf16, PROMPT_PREFIX_TAIL[i], dim);
+
+    for (int i = 0; i < enc_seq_len; i++)
+        memcpy(input_embeds + (prefix_len + i) * dim, enc_output + i * dim, dim * sizeof(float));
+    free(enc_output);
+
+    int suffix_off = prefix_len + enc_seq_len;
+    for (int i = 0; i < SUFFIX_BASE_LEN; i++)
+        tok_embed_bf16_to_f32(input_embeds + (suffix_off + i) * dim,
+                              ctx->decoder.tok_embeddings_bf16, PROMPT_SUFFIX_BASE[i], dim);
+    for (int i = 0; i < ctx->n_force_prompt_tokens; i++)
+        tok_embed_bf16_to_f32(input_embeds + (suffix_off + SUFFIX_BASE_LEN + i) * dim,
+                              ctx->decoder.tok_embeddings_bf16, ctx->force_prompt_tokens[i], dim);
+
+    int past_off = suffix_off + suffix_len;
+    for (int i = 0; i < n_past_tokens; i++)
+        tok_embed_bf16_to_f32(input_embeds + (past_off + i) * dim,
+                              ctx->decoder.tok_embeddings_bf16, past_tokens[i], dim);
+    if (n_past_tokens > 0)
+        tok_embed_bf16_to_f32(input_embeds + (past_off + n_past_tokens) * dim,
+                              ctx->decoder.tok_embeddings_bf16, QWEN_TOKEN_ASR_TEXT, dim);
+
+    *out_total_seq = total_seq;
+    return input_embeds;
+}
+
+/* Decode one segment from PRECOMPUTED encoder output (mel + encoder already run).
+ * Takes ownership of enc_output (frees it before returning). Returns the malloc'd
+ * segment transcript. Accounts perf_decode_ms + perf_text_tokens; the caller owns
+ * encode/total perf accounting. Shared by the serial path (transcribe_segment) and
+ * the --gpu pipelined path, so the decode body has a single source of truth. */
+static char *decode_segment_from_enc(qwen_ctx_t *ctx, float *enc_output, int enc_seq_len,
+                                     qwen_tokenizer_t *tokenizer,
+                                     const int *past_tokens, int n_past_tokens,
+                                     int *out_text_tokens) {
     const qwen_config_t *cfg = &ctx->config;
     int dim = cfg->dec_hidden;
-    double seg_t0 = get_time_ms();
     int n_text_tokens = 0;
-
-    /* ---- Mel spectrogram ---- */
-    double t0 = get_time_ms();
-    int mel_frames = 0;
-    float *mel = qwen_mel_spectrogram(samples, n_samples, &mel_frames);
-    if (!mel) return NULL;
-    double mel_ms = get_time_ms() - t0;
-
-    if (qwen_verbose >= 2)
-        fprintf(stderr, "  Mel: %d frames (%.0f ms)\n", mel_frames, mel_ms);
-
-    /* ---- Encoder ---- */
-    t0 = get_time_ms();
-    int enc_seq_len = 0;
-    float *enc_output = qwen_encoder_forward(ctx, mel, mel_frames, &enc_seq_len);
-    free(mel);
-    if (!enc_output) return NULL;
-    double enc_ms = get_time_ms() - t0;
-
-    if (qwen_verbose >= 2)
-        fprintf(stderr, "  Encoder: %d tokens (%.0f ms)\n", enc_seq_len, enc_ms);
 
     if (prepare_prompt_tokens(ctx, tokenizer) != 0) {
         free(enc_output);
         return NULL;
     }
 
-    /* ---- Build input embeddings ---- */
-    int prefix_len = PREFIX_HEAD_LEN + ctx->n_prompt_tokens + PREFIX_TAIL_LEN;
-    int suffix_len = SUFFIX_BASE_LEN + ctx->n_force_prompt_tokens;
-    int n_past_prompt_tokens = (n_past_tokens > 0) ? (n_past_tokens + 1) : 0; /* + <asr_text> */
-    int total_seq = prefix_len + enc_seq_len + suffix_len + n_past_prompt_tokens;
-    float *input_embeds = (float *)malloc((size_t)total_seq * dim * sizeof(float));
+    int total_seq = 0;
+    float *input_embeds = build_segment_input_embeds(ctx, enc_output, enc_seq_len,
+                                                     past_tokens, n_past_tokens, &total_seq);
+    if (!input_embeds) return NULL;   /* enc_output already freed */
     float *tmp_embed = (float *)malloc(dim * sizeof(float));
-    if (!input_embeds || !tmp_embed) {
-        free(enc_output);
-        free(input_embeds);
-        free(tmp_embed);
-        return NULL;
-    }
-
-    /* Embed prefix head: <|im_start|>system\n */
-    int off = 0;
-    for (int i = 0; i < PREFIX_HEAD_LEN; i++) {
-        tok_embed_bf16_to_f32(input_embeds + off * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              PROMPT_PREFIX_HEAD[i], dim);
-        off++;
-    }
-
-    /* Embed optional prompt text (system content) */
-    for (int i = 0; i < ctx->n_prompt_tokens; i++) {
-        tok_embed_bf16_to_f32(input_embeds + off * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              ctx->prompt_tokens[i], dim);
-        off++;
-    }
-
-    /* Embed prefix tail: <|im_end|>\n<|im_start|>user\n<|audio_start|> */
-    for (int i = 0; i < PREFIX_TAIL_LEN; i++) {
-        tok_embed_bf16_to_f32(input_embeds + off * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              PROMPT_PREFIX_TAIL[i], dim);
-        off++;
-    }
-
-    /* Replace audio_pad positions with encoder output */
-    for (int i = 0; i < enc_seq_len; i++) {
-        memcpy(input_embeds + (prefix_len + i) * dim,
-               enc_output + i * dim,
-               dim * sizeof(float));
-    }
-    free(enc_output);
-
-    /* Embed suffix base: <|audio_end|><|im_end|>\n<|im_start|>assistant\n */
-    int suffix_off = prefix_len + enc_seq_len;
-    for (int i = 0; i < SUFFIX_BASE_LEN; i++) {
-        tok_embed_bf16_to_f32(input_embeds + (suffix_off + i) * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              PROMPT_SUFFIX_BASE[i], dim);
-    }
-
-    /* Optional forced-language suffix: "language X" + <asr_text> */
-    for (int i = 0; i < ctx->n_force_prompt_tokens; i++) {
-        tok_embed_bf16_to_f32(input_embeds + (suffix_off + SUFFIX_BASE_LEN + i) * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              ctx->force_prompt_tokens[i], dim);
-    }
-
-    /* Optional past-text conditioning tokens (for segmented mode).
-     * Put a fresh <asr_text> marker AFTER the past text so generation
-     * restarts from a new ASR span instead of terminating immediately. */
-    int past_off = suffix_off + suffix_len;
-    for (int i = 0; i < n_past_tokens; i++) {
-        tok_embed_bf16_to_f32(input_embeds + (past_off + i) * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              past_tokens[i], dim);
-    }
-    if (n_past_tokens > 0) {
-        tok_embed_bf16_to_f32(input_embeds + (past_off + n_past_tokens) * dim,
-                              ctx->decoder.tok_embeddings_bf16,
-                              QWEN_TOKEN_ASR_TEXT, dim);
-    }
+    if (!tmp_embed) { free(input_embeds); return NULL; }
 
     /* ---- Decoder prefill ---- */
-    t0 = get_time_ms();
+    double t0 = get_time_ms();
     ctx->kv_cache_len = 0; /* Reset KV cache for this segment */
     int prefill_len = total_seq - 1; /* prefill all but last */
     qwen_decoder_prefill(ctx, input_embeds, prefill_len);
@@ -774,12 +741,43 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     while (*start && isspace((unsigned char)*start)) start++;
     if (start != text) memmove(text, start, strlen(start) + 1);
 
-    ctx->perf_total_ms += get_time_ms() - seg_t0;
     ctx->perf_text_tokens += n_text_tokens;
-    ctx->perf_encode_ms += mel_ms + enc_ms;
     ctx->perf_decode_ms += prefill_ms + decode_ms;
     if (out_text_tokens) *out_text_tokens = n_text_tokens;
 
+    return text;
+}
+
+/* Serial path: mel + encoder, then decode. Accounts encode + total perf;
+ * decode_segment_from_enc accounts the decode side. */
+static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
+                                int n_samples, qwen_tokenizer_t *tokenizer,
+                                const int *past_tokens, int n_past_tokens,
+                                int *out_text_tokens) {
+    double seg_t0 = get_time_ms();
+
+    double t0 = get_time_ms();
+    int mel_frames = 0;
+    float *mel = qwen_mel_spectrogram(samples, n_samples, &mel_frames);
+    if (!mel) return NULL;
+    double mel_ms = get_time_ms() - t0;
+    if (qwen_verbose >= 2)
+        fprintf(stderr, "  Mel: %d frames (%.0f ms)\n", mel_frames, mel_ms);
+
+    t0 = get_time_ms();
+    int enc_seq_len = 0;
+    float *enc_output = qwen_encoder_forward(ctx, mel, mel_frames, &enc_seq_len);
+    free(mel);
+    if (!enc_output) return NULL;
+    double enc_ms = get_time_ms() - t0;
+    if (qwen_verbose >= 2)
+        fprintf(stderr, "  Encoder: %d tokens (%.0f ms)\n", enc_seq_len, enc_ms);
+
+    char *text = decode_segment_from_enc(ctx, enc_output, enc_seq_len, tokenizer,
+                                         past_tokens, n_past_tokens, out_text_tokens);
+
+    ctx->perf_encode_ms += mel_ms + enc_ms;
+    ctx->perf_total_ms += get_time_ms() - seg_t0;
     return text;
 }
 
@@ -907,6 +905,431 @@ static char *json_build(const char *full_text, const char *segs_inner) {
     return j;
 }
 
+/* ========================================================================
+ * Lever 1: pipelined GPU segmented decode
+ * ------------------------------------------------------------------------
+ * A producer thread runs mel + encoder (CPU; BLAS/Accelerate — disjoint from
+ * the decoder's `tp` threadpool and from the GPU/CoreML state) for each segment
+ * into a bounded FIFO; the consumer (caller thread) prefills + decodes each on
+ * the GPU. Encode of segment N+1 overlaps decode of segment N, hiding the CPU
+ * encode behind the longer GPU decode. Only used for --gpu, where past_text=no
+ * makes segments independent (no cross-segment state), so the producer never
+ * touches mutable decoder state and only the queue needs synchronisation.
+ * ======================================================================== */
+
+static int stream_encode_span(qwen_ctx_t *ctx, const float *samples, int n_samples,
+                              float **out_enc_output, int *out_seq_len); /* fwd decl */
+
+typedef struct {
+    int core_start, core_end;
+    float *enc_output;     /* owned by consumer (decode_segment_from_enc frees it) */
+    int enc_seq_len;
+    double enc_ms;         /* mel + encoder time (added to perf by the consumer) */
+} enc_pipe_item_t;
+
+typedef struct {
+    enc_pipe_item_t *slots;
+    int cap, head, tail, count;
+    int closed;            /* set when the producer has pushed every segment */
+    pthread_mutex_t mtx;
+    pthread_cond_t not_full, not_empty;
+} enc_pipe_t;
+
+typedef struct {
+    qwen_ctx_t *ctx;
+    const float *audio_samples;
+    const int *splits;
+    int n_splits;
+    int min_samples;
+    enc_pipe_t *pipe;
+} enc_producer_args_t;
+
+static void *enc_producer(void *argp) {
+    enc_producer_args_t *pa = (enc_producer_args_t *)argp;
+    enc_pipe_t *q = pa->pipe;
+    for (int s = 0; s < pa->n_splits; s++) {
+        int core_start = pa->splits[s];
+        int core_end = pa->splits[s + 1];
+        int seg_samples = core_end - core_start;
+        const float *seg_ptr = pa->audio_samples + core_start;
+        float *seg_buf = NULL;
+        if (seg_samples < pa->min_samples) {
+            seg_buf = (float *)calloc(pa->min_samples, sizeof(float));
+            if (seg_buf) {
+                memcpy(seg_buf, seg_ptr, (size_t)seg_samples * sizeof(float));
+                seg_ptr = seg_buf;
+                seg_samples = pa->min_samples;
+            }
+        }
+
+        double t0 = get_time_ms();
+        float *enc_output = NULL;
+        int enc_seq_len = 0;
+        if (stream_encode_span(pa->ctx, seg_ptr, seg_samples, &enc_output, &enc_seq_len) != 0)
+            enc_output = NULL;
+        double enc_ms = get_time_ms() - t0;
+        free(seg_buf);
+
+        pthread_mutex_lock(&q->mtx);
+        while (q->count == q->cap) pthread_cond_wait(&q->not_full, &q->mtx);
+        enc_pipe_item_t *it = &q->slots[q->tail];
+        it->core_start = core_start;
+        it->core_end = core_end;
+        it->enc_output = enc_output;
+        it->enc_seq_len = enc_seq_len;
+        it->enc_ms = enc_ms;
+        q->tail = (q->tail + 1) % q->cap;
+        q->count++;
+        pthread_cond_signal(&q->not_empty);
+        pthread_mutex_unlock(&q->mtx);
+    }
+    pthread_mutex_lock(&q->mtx);
+    q->closed = 1;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->mtx);
+    return NULL;
+}
+
+/* Append a finished segment transcript to the running result (and JSON segs).
+ * Live token emission already happened during decode via segment_emit_cb, so we
+ * only grow `result` here (mirrors the serial fast-emit path). */
+static void pipe_append_segment(qwen_ctx_t *ctx, char *seg_text,
+                                int core_start, int core_end,
+                                char **result, size_t *result_len, size_t *result_cap,
+                                char **segs, size_t *segs_len, size_t *segs_cap) {
+    if (!seg_text || seg_text[0] == '\0') return;
+    size_t add_len = strlen(seg_text);
+    int need_space = should_insert_boundary_space(
+        *result_len > 0 ? (int)(unsigned char)(*result)[*result_len - 1] : 0,
+        (int)(unsigned char)seg_text[0]);
+    size_t need = *result_len + add_len + (size_t)(need_space ? 2 : 1);
+    if (need > *result_cap) {
+        while (need > *result_cap) *result_cap *= 2;
+        *result = (char *)realloc(*result, *result_cap);
+    }
+    if (need_space) (*result)[(*result_len)++] = ' ';
+    memcpy(*result + *result_len, seg_text, add_len);
+    *result_len += add_len;
+    (*result)[*result_len] = '\0';
+    if (ctx->emit_json)
+        json_seg_append(segs, segs_len, segs_cap, core_start, core_end, seg_text);
+}
+
+static char *transcribe_segments_gpu_pipelined(qwen_ctx_t *ctx, const float *audio_samples,
+                                               const int *splits, int n_splits,
+                                               int min_samples, qwen_tokenizer_t *tokenizer) {
+    enc_pipe_t pipe;
+    pipe.cap = 4;
+    pipe.slots = (enc_pipe_item_t *)calloc((size_t)pipe.cap, sizeof(enc_pipe_item_t));
+    pipe.head = pipe.tail = pipe.count = 0;
+    pipe.closed = 0;
+    pthread_mutex_init(&pipe.mtx, NULL);
+    pthread_cond_init(&pipe.not_full, NULL);
+    pthread_cond_init(&pipe.not_empty, NULL);
+
+    enc_producer_args_t pa = { ctx, audio_samples, splits, n_splits, min_samples, &pipe };
+    pthread_t prod;
+    int threaded = (pipe.slots != NULL && pthread_create(&prod, NULL, enc_producer, &pa) == 0);
+
+    size_t result_cap = 4096, result_len = 0;
+    char *result = (char *)malloc(result_cap);
+    result[0] = '\0';
+    char *segs = NULL; size_t segs_len = 0, segs_cap = 0;
+    if (ctx->emit_json) { segs_cap = 4096; segs = (char *)malloc(segs_cap); segs[0] = '\0'; }
+    qwen_token_cb saved_cb = ctx->token_cb;
+    void *saved_cb_userdata = ctx->token_cb_userdata;
+
+    if (!threaded) {
+        /* Fallback: no producer thread — encode + decode serially in order. */
+        for (int s = 0; s < n_splits; s++) {
+            int core_start = splits[s], core_end = splits[s + 1];
+            int seg_samples = core_end - core_start;
+            const float *seg_ptr = audio_samples + core_start;
+            float *seg_buf = NULL;
+            if (seg_samples < min_samples) {
+                seg_buf = (float *)calloc(min_samples, sizeof(float));
+                if (seg_buf) { memcpy(seg_buf, seg_ptr, (size_t)seg_samples * sizeof(float));
+                               seg_ptr = seg_buf; seg_samples = min_samples; }
+            }
+            double t0 = get_time_ms();
+            float *enc_output = NULL; int enc_seq_len = 0;
+            if (stream_encode_span(ctx, seg_ptr, seg_samples, &enc_output, &enc_seq_len) != 0)
+                enc_output = NULL;
+            ctx->perf_encode_ms += get_time_ms() - t0;
+            free(seg_buf);
+            if (!enc_output || enc_seq_len <= 0) { free(enc_output); continue; }
+
+            segment_emit_state_t emit_state = {0};
+            if (saved_cb) {
+                emit_state.downstream_cb = saved_cb;
+                emit_state.downstream_userdata = saved_cb_userdata;
+                emit_state.maybe_prepend_space =
+                    (result_len > 0 && !isspace((unsigned char)result[result_len - 1]));
+                ctx->token_cb = segment_emit_cb;
+                ctx->token_cb_userdata = &emit_state;
+            }
+            char *seg_text = decode_segment_from_enc(ctx, enc_output, enc_seq_len,
+                                                     tokenizer, NULL, 0, NULL);
+            ctx->token_cb = saved_cb; ctx->token_cb_userdata = saved_cb_userdata;
+            pipe_append_segment(ctx, seg_text, core_start, core_end,
+                                &result, &result_len, &result_cap,
+                                &segs, &segs_len, &segs_cap);
+            free(seg_text);
+        }
+    } else {
+        for (;;) {
+            pthread_mutex_lock(&pipe.mtx);
+            while (pipe.count == 0 && !pipe.closed)
+                pthread_cond_wait(&pipe.not_empty, &pipe.mtx);
+            if (pipe.count == 0 && pipe.closed) { pthread_mutex_unlock(&pipe.mtx); break; }
+            enc_pipe_item_t it = pipe.slots[pipe.head];
+            pipe.head = (pipe.head + 1) % pipe.cap;
+            pipe.count--;
+            pthread_cond_signal(&pipe.not_full);
+            pthread_mutex_unlock(&pipe.mtx);
+
+            ctx->perf_encode_ms += it.enc_ms;
+            if (!it.enc_output || it.enc_seq_len <= 0) { free(it.enc_output); continue; }
+
+            segment_emit_state_t emit_state = {0};
+            if (saved_cb) {
+                emit_state.downstream_cb = saved_cb;
+                emit_state.downstream_userdata = saved_cb_userdata;
+                emit_state.maybe_prepend_space =
+                    (result_len > 0 && !isspace((unsigned char)result[result_len - 1]));
+                ctx->token_cb = segment_emit_cb;
+                ctx->token_cb_userdata = &emit_state;
+            }
+            char *seg_text = decode_segment_from_enc(ctx, it.enc_output, it.enc_seq_len,
+                                                     tokenizer, NULL, 0, NULL);
+            ctx->token_cb = saved_cb; ctx->token_cb_userdata = saved_cb_userdata;
+            pipe_append_segment(ctx, seg_text, it.core_start, it.core_end,
+                                &result, &result_len, &result_cap,
+                                &segs, &segs_len, &segs_cap);
+            free(seg_text);
+        }
+        pthread_join(prod, NULL);
+    }
+
+    ctx->token_cb = saved_cb;
+    ctx->token_cb_userdata = saved_cb_userdata;
+    pthread_mutex_destroy(&pipe.mtx);
+    pthread_cond_destroy(&pipe.not_full);
+    pthread_cond_destroy(&pipe.not_empty);
+    free(pipe.slots);
+
+    if (ctx->emit_json) {
+        char *json = json_build(result, segs ? segs : "");
+        free(segs);
+        free(result);
+        return json;
+    }
+    return result;
+}
+
+#ifdef QWEN_GPU
+/* ========================================================================
+ * Lever 3: batched GPU decode (B independent segments per forward).
+ * ------------------------------------------------------------------------
+ * Reuses the Lever-1 producer to encode segments into a FIFO; the consumer
+ * groups B encoded segments and decodes them together in one batched on-device
+ * forward (lm_head + argmax fused on the GPU, returning token ids). Decode is
+ * overhead-bound at B=1, so B lanes amortize dispatch and fill the GPU. Encode
+ * still overlaps the batched decode. --past-text no => segments independent.
+ * ======================================================================== */
+
+typedef struct { char *text; size_t len, cap; int past_asr, done, pos, cur, n_text; } blane_t;
+
+static void blane_emit_token(blane_t *L, int t, qwen_tokenizer_t *tok) {
+    if (t == QWEN_TOKEN_ASR_TEXT) { L->past_asr = 1; return; }
+    if (!L->past_asr) return;                          /* skip language/marker preamble */
+    const char *piece = qwen_tokenizer_decode(tok, t);
+    if (!piece) return;
+    size_t pl = strlen(piece);
+    if (L->len + pl + 1 > L->cap) {
+        if (!L->cap) L->cap = 256;
+        while (L->len + pl + 1 > L->cap) L->cap *= 2;
+        L->text = (char *)realloc(L->text, L->cap);
+    }
+    memcpy(L->text + L->len, piece, pl);
+    L->len += pl; L->text[L->len] = '\0'; L->n_text++;
+}
+
+static char *transcribe_segments_gpu_batched(qwen_ctx_t *ctx, const float *audio_samples,
+                                             const int *splits, int n_splits,
+                                             int min_samples, qwen_tokenizer_t *tokenizer) {
+    const qwen_config_t *cfg = &ctx->config;
+    int dim = cfg->dec_hidden, hd = cfg->dec_head_dim;
+    int B = gpu_decb_batch();
+    int MAXP = gpu_dec_max();
+    if (B < 1) B = 1;
+    qwen_decoder_ensure_rope(ctx, MAXP);               /* positions 0..MAXP-1 */
+    prepare_prompt_tokens(ctx, tokenizer);
+
+    /* producer thread: encode all segments into the FIFO (depth B+2 so a full
+     * batch can form while the previous batch decodes). */
+    enc_pipe_t pipe;
+    pipe.cap = B + 2;
+    pipe.slots = (enc_pipe_item_t *)calloc((size_t)pipe.cap, sizeof(enc_pipe_item_t));
+    pipe.head = pipe.tail = pipe.count = 0; pipe.closed = 0;
+    pthread_mutex_init(&pipe.mtx, NULL);
+    pthread_cond_init(&pipe.not_full, NULL); pthread_cond_init(&pipe.not_empty, NULL);
+    enc_producer_args_t pa = { ctx, audio_samples, splits, n_splits, min_samples, &pipe };
+    pthread_t prod;
+    int threaded = (pipe.slots != NULL && pthread_create(&prod, NULL, enc_producer, &pa) == 0);
+
+    size_t result_cap = 4096, result_len = 0;
+    char *result = (char *)malloc(result_cap); result[0] = '\0';
+    char *segs = NULL; size_t segs_len = 0, segs_cap = 0;
+    if (ctx->emit_json) { segs_cap = 4096; segs = (char *)malloc(segs_cap); segs[0] = '\0'; }
+    qwen_token_cb saved_cb = ctx->token_cb;
+    void *saved_ud = ctx->token_cb_userdata;
+
+    /* per-batch scratch */
+    float *embstep = (float *)malloc((size_t)B * dim * sizeof(float));
+    float *cosb = (float *)malloc((size_t)B * hd * sizeof(float));
+    float *sinb = (float *)malloc((size_t)B * hd * sizeof(float));
+    int *positions = (int *)malloc((size_t)B * sizeof(int));
+    int *lens = (int *)malloc((size_t)B * sizeof(int));
+    int *first = (int *)malloc((size_t)B * sizeof(int));
+    int *nxt = (int *)malloc((size_t)B * sizeof(int));
+    float **emb = (float **)malloc((size_t)B * sizeof(float *));
+    int *total_seq = (int *)malloc((size_t)B * sizeof(int));
+    int *core_start = (int *)malloc((size_t)B * sizeof(int));
+    int *core_end = (int *)malloc((size_t)B * sizeof(int));
+    blane_t *lane = (blane_t *)calloc((size_t)B, sizeof(blane_t));
+    int max_tokens = 2048;
+
+    for (;;) {
+        /* collect up to B encoded segments (in order) */
+        int ng = 0;
+        while (ng < B) {
+            pthread_mutex_lock(&pipe.mtx);
+            while (pipe.count == 0 && !pipe.closed) pthread_cond_wait(&pipe.not_empty, &pipe.mtx);
+            int empty_closed = (pipe.count == 0 && pipe.closed);
+            enc_pipe_item_t it; memset(&it, 0, sizeof(it));
+            if (!empty_closed) {
+                it = pipe.slots[pipe.head];
+                pipe.head = (pipe.head + 1) % pipe.cap; pipe.count--;
+                pthread_cond_signal(&pipe.not_full);
+            }
+            pthread_mutex_unlock(&pipe.mtx);
+            if (empty_closed) break;
+            ctx->perf_encode_ms += it.enc_ms;
+            if (!it.enc_output || it.enc_seq_len <= 0) { free(it.enc_output); continue; }
+            emb[ng] = build_segment_input_embeds(ctx, it.enc_output, it.enc_seq_len,
+                                                 NULL, 0, &total_seq[ng]);
+            if (!emb[ng]) continue;
+            core_start[ng] = it.core_start; core_end[ng] = it.core_end;
+            ng++;
+        }
+        if (ng == 0) break;
+
+        double t0 = get_time_ms();
+        int Lmax = 1;
+        for (int b = 0; b < ng; b++) if (total_seq[b] > Lmax) Lmax = total_seq[b];
+        if (Lmax > MAXP) Lmax = MAXP;
+
+        float *X = (float *)calloc((size_t)B * Lmax * dim, sizeof(float));
+        for (int b = 0; b < ng; b++) {
+            int L = total_seq[b] > Lmax ? Lmax : total_seq[b];
+            memcpy(X + (size_t)b * Lmax * dim, emb[b], (size_t)L * dim * sizeof(float));
+            lens[b] = L;
+            free(emb[b]); emb[b] = NULL;
+        }
+        for (int b = ng; b < B; b++) lens[b] = 1;          /* inert lanes */
+
+        gpu_decb_reset();
+        gpu_decb_prefill(X, lens, Lmax, ctx->rope_cache_cos, ctx->rope_cache_sin, first);
+        free(X);
+
+        for (int b = 0; b < B; b++) {
+            lane[b].text = NULL; lane[b].len = 0; lane[b].cap = 0; lane[b].n_text = 0;
+            lane[b].past_asr = (ctx->n_force_prompt_tokens > 0) ? 1 : 0;
+            lane[b].done = (b >= ng);
+            lane[b].cur = (b < ng) ? first[b] : 0;
+            lane[b].pos = (b < ng) ? total_seq[b] : 0;
+        }
+
+        for (int steps = 0; steps < max_tokens; steps++) {
+            int any = 0;
+            for (int b = 0; b < ng; b++) {
+                if (lane[b].done) continue;
+                int t = lane[b].cur;
+                if (t == QWEN_TOKEN_ENDOFTEXT || t == QWEN_TOKEN_IM_END || lane[b].pos >= MAXP) {
+                    lane[b].done = 1; continue;
+                }
+                blane_emit_token(&lane[b], t, tokenizer);
+                any = 1;
+            }
+            if (!any) break;
+            for (int b = 0; b < B; b++) {
+                int p;
+                if (b < ng && !lane[b].done) {
+                    tok_embed_bf16_to_f32(embstep + (size_t)b * dim,
+                                          ctx->decoder.tok_embeddings_bf16, lane[b].cur, dim);
+                    p = lane[b].pos;
+                } else {
+                    memset(embstep + (size_t)b * dim, 0, (size_t)dim * sizeof(float));
+                    p = (b < ng) ? lane[b].pos : 0;
+                }
+                if (p >= MAXP) p = MAXP - 1; if (p < 0) p = 0;
+                positions[b] = p;
+                memcpy(cosb + (size_t)b * hd, ctx->rope_cache_cos + (size_t)p * hd, (size_t)hd * sizeof(float));
+                memcpy(sinb + (size_t)b * hd, ctx->rope_cache_sin + (size_t)p * hd, (size_t)hd * sizeof(float));
+            }
+            gpu_decb_step(embstep, positions, cosb, sinb, nxt);
+            for (int b = 0; b < ng; b++) {
+                if (lane[b].done) continue;
+                lane[b].pos++;
+                lane[b].cur = nxt[b];
+            }
+        }
+
+        /* append + emit each segment in order (within and across groups) */
+        for (int b = 0; b < ng; b++) {
+            char *st = lane[b].text;
+            size_t sl = st ? strlen(st) : 0;
+            while (sl > 0 && isspace((unsigned char)st[sl - 1])) st[--sl] = '\0';
+            char *s2 = st;
+            while (s2 && *s2 && isspace((unsigned char)*s2)) s2++;
+            if (s2 && *s2) {
+                size_t add = strlen(s2);
+                int need_space = should_insert_boundary_space(
+                    result_len > 0 ? (int)(unsigned char)result[result_len - 1] : 0,
+                    (int)(unsigned char)s2[0]);
+                size_t need = result_len + add + (size_t)(need_space ? 2 : 1);
+                if (need > result_cap) { while (need > result_cap) result_cap *= 2;
+                                         result = (char *)realloc(result, result_cap); }
+                if (need_space) { result[result_len++] = ' '; if (saved_cb) saved_cb(" ", saved_ud); }
+                memcpy(result + result_len, s2, add); result_len += add; result[result_len] = '\0';
+                if (ctx->emit_json)
+                    json_seg_append(&segs, &segs_len, &segs_cap, core_start[b], core_end[b], s2);
+                if (saved_cb) saved_cb(s2, saved_ud);
+            }
+            ctx->perf_text_tokens += lane[b].n_text;
+            free(lane[b].text); lane[b].text = NULL;
+        }
+        ctx->perf_decode_ms += get_time_ms() - t0;
+    }
+
+    if (threaded) pthread_join(prod, NULL);
+    pthread_mutex_destroy(&pipe.mtx);
+    pthread_cond_destroy(&pipe.not_full); pthread_cond_destroy(&pipe.not_empty);
+    free(pipe.slots);
+    free(embstep); free(cosb); free(sinb); free(positions); free(lens);
+    free(first); free(nxt); free(emb); free(total_seq); free(core_start); free(core_end);
+    free(lane);
+
+    if (ctx->emit_json) {
+        char *json = json_build(result, segs ? segs : "");
+        free(segs); free(result);
+        return json;
+    }
+    return result;
+}
+#endif /* QWEN_GPU */
+
 char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples) {
     ctx->perf_total_ms = 0;
     ctx->perf_text_tokens = 0;
@@ -988,6 +1411,35 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
 
     if (qwen_verbose >= 2)
         fprintf(stderr, "Splitting into %d segments\n", n_splits);
+
+#ifdef QWEN_GPU
+    if (ctx->config.use_gpu && gpu_decb_ready() && !getenv("QWEN_GPU_NO_BATCH")) {
+        /* Lever 3: batched GPU decode (B independent segments per forward),
+         * with encode still pipelined ahead. (QWEN_GPU_NO_BATCH=1 -> Lever 1.) */
+        int min_samples = QWEN_SAMPLE_RATE / 2;
+        double bt0 = get_time_ms();
+        char *gpu_result = transcribe_segments_gpu_batched(
+            ctx, audio_samples, splits, n_splits, min_samples, tokenizer);
+        ctx->perf_total_ms += get_time_ms() - bt0;
+        qwen_tokenizer_free(tokenizer);
+        free(compacted_samples);
+        return gpu_result;
+    }
+#endif
+    if (ctx->config.use_gpu && !getenv("QWEN_GPU_NO_PIPELINE")) {
+        /* Lever 1: pipeline CPU encode behind GPU decode. Segments are
+         * independent under --gpu (past_text=no), so encode of seg N+1 can
+         * run on a CPU thread while seg N decodes on the GPU.
+         * (QWEN_GPU_NO_PIPELINE=1 falls back to the serial loop for A/B.) */
+        int min_samples = QWEN_SAMPLE_RATE / 2;
+        double pipe_t0 = get_time_ms();
+        char *gpu_result = transcribe_segments_gpu_pipelined(
+            ctx, audio_samples, splits, n_splits, min_samples, tokenizer);
+        ctx->perf_total_ms += get_time_ms() - pipe_t0;
+        qwen_tokenizer_free(tokenizer);
+        free(compacted_samples);
+        return gpu_result;
+    }
 
     /* Transcribe each segment and concatenate */
     size_t result_cap = 4096;

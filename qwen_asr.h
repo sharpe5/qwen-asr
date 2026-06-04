@@ -322,6 +322,9 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
 /* Decoder forward (single token, uses KV cache, returns greedy token) */
 int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed);
 
+/* Ensure decoder RoPE cache covers [0, n_positions); fills ctx->rope_cache_cos/sin. */
+int qwen_decoder_ensure_rope(qwen_ctx_t *ctx, int n_positions);
+
 /* Global verbose flag */
 extern int qwen_verbose;
 

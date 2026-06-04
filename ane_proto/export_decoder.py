@@ -36,10 +36,18 @@ inputs = [
     ct.TensorType(name="wmask", shape=(MAX, sr),   dtype=np.float32),
     ct.TensorType(name="amask", shape=(1, 1, sr, MAX), dtype=np.float32),
 ]
+QUANT = (len(sys.argv) > 2 and sys.argv[2] == "int8")
 t0 = time.perf_counter()
 ml = ct.convert(traced, inputs=inputs,
                 outputs=[ct.TensorType(name="hidden", dtype=np.float32)],
                 states=states, compute_precision=ct.precision.FLOAT16,
                 minimum_deployment_target=ct.target.macOS15)
+if QUANT:
+    from coremltools.optimize.coreml import (linear_quantize_weights,
+                                             OptimizationConfig, OpLinearQuantizerConfig)
+    cfg = OptimizationConfig(global_config=OpLinearQuantizerConfig(
+        mode="linear_symmetric", dtype="int8", granularity="per_channel"))
+    ml = linear_quantize_weights(ml, cfg)   # weight-only int8 -> ~half per-token bandwidth
+    print("applied int8 weight-only quantization (per-channel symmetric)")
 ml.save(OUT)
-print(f"saved {OUT} ({time.perf_counter()-t0:.1f}s) flexible S=1..{MAX}")
+print(f"saved {OUT} ({time.perf_counter()-t0:.1f}s) flexible S=1..{MAX}{' int8' if QUANT else ' fp16'}")
