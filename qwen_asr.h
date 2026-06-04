@@ -66,6 +66,11 @@ typedef struct {
     int vocab_size;            /* 151936 */
     float dec_rms_norm_eps;    /* 1e-6 */
     float dec_rope_theta;      /* 1e6 */
+
+    /* GPU fast path: when set, the decoder runs on the GPU via CoreML
+     * (coreml_decoder.mm). Requires the `gpu` build + qwen_decoder_gpu.mlpackage.
+     * Only valid with independent chunks (past_text == no). */
+    int use_gpu;               /* 0 = CPU (default), 1 = CoreML GPU decoder */
 } qwen_config_t;
 
 /* ========================================================================

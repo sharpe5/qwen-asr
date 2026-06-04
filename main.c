@@ -12,6 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef QWEN_GPU
+#include "coreml_decoder.h"   /* GPU fast path (CoreML); only in the `gpu` build */
+#endif
+
 /* Token streaming callback: print each piece as it's decoded */
 static void stream_token(const char *piece, void *userdata) {
     (void)userdata;
@@ -72,6 +76,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --debug       Debug output (per-layer details)\n");
     fprintf(stderr, "  --silent      No status output (only final transcription on stdout)\n");
     fprintf(stderr, "                 with -i + --stream, uses non-interactive final refinement\n");
+    fprintf(stderr, "  --gpu         Run the decoder on the GPU via CoreML (needs `make gpu` +\n");
+    fprintf(stderr, "                qwen_decoder_gpu.mlpackage; segmented, --past-text no only; 0.6B)\n");
     fprintf(stderr, "  -h            Show this help\n");
 }
 
@@ -92,6 +98,7 @@ int main(int argc, char **argv) {
     int skip_silence = 0;
     int json_output = 0;
     int emit_tokens = 1;
+    int use_gpu = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
@@ -135,6 +142,8 @@ int main(int argc, char **argv) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {
             verbosity = 0;
+        } else if (strcmp(argv[i], "--gpu") == 0) {
+            use_gpu = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -195,6 +204,44 @@ int main(int argc, char **argv) {
         ctx->past_text_conditioning = 1;
     if (skip_silence) ctx->skip_silence = 1;
     if (json_output) ctx->emit_json = 1;
+
+    /* GPU fast path: decoder on CoreML/GPU (independent chunks only). */
+    if (use_gpu) {
+#ifdef QWEN_GPU
+        if (ctx->past_text_conditioning == 1) {
+            fprintf(stderr, "Error: --gpu does not support --past-text yes "
+                            "(GPU decodes chunks independently for parallelism and quality)\n");
+            qwen_free(ctx); return 1;
+        }
+        if (stream_mode) {
+            fprintf(stderr, "Error: --gpu is for segmented decode, not --stream\n");
+            qwen_free(ctx); return 1;
+        }
+        if (ctx->segment_sec <= 0.0f) ctx->segment_sec = 28.0f;  /* bounded GPU cache */
+        if (ctx->segment_sec > 40.0f) {
+            fprintf(stderr, "Error: --gpu requires -S <= 40 (GPU KV cache holds ~512 tokens)\n");
+            qwen_free(ctx); return 1;
+        }
+        if (ctx->config.dec_hidden != gpu_dec_hidden()) {
+            fprintf(stderr, "Error: --gpu .mlpackage is for the 0.6B model "
+                            "(engine hidden=%d, gpu=%d)\n", ctx->config.dec_hidden, gpu_dec_hidden());
+            qwen_free(ctx); return 1;
+        }
+        const char *mpath = getenv("QWEN_GPU_MODEL");
+        if (!mpath) mpath = "qwen_decoder_gpu.mlpackage";
+        if (gpu_dec_init(mpath) != 0) {
+            fprintf(stderr, "Error: failed to init GPU decoder from %s "
+                            "(set QWEN_GPU_MODEL to the .mlpackage path)\n", mpath);
+            qwen_free(ctx); return 1;
+        }
+        ctx->config.use_gpu = 1;
+        if (qwen_verbose > 0) fprintf(stderr, "GPU decoder enabled (CoreML CPU+GPU): %s\n", mpath);
+#else
+        fprintf(stderr, "Error: --gpu not available in this build; rebuild with `make gpu`\n");
+        qwen_free(ctx); return 1;
+#endif
+    }
+
     if (prompt_text && qwen_set_prompt(ctx, prompt_text) != 0) {
         fprintf(stderr, "Failed to set --prompt text\n");
         qwen_free(ctx);

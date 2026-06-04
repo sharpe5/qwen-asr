@@ -17,7 +17,7 @@ TARGET = qwen_asr
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug info help blas test test-stream-cache
+.PHONY: all clean debug info help blas gpu gpu_link test test-stream-cache
 
 # Default: show available targets
 all: help
@@ -27,6 +27,7 @@ help:
 	@echo ""
 	@echo "Choose a backend:"
 	@echo "  make blas     - With BLAS acceleration (Accelerate/OpenBLAS)"
+	@echo "  make gpu      - BLAS + CoreML GPU decoder fast path (--gpu, macOS)"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make debug    - Debug build with AddressSanitizer"
@@ -54,6 +55,31 @@ blas:
 	@echo "Built with BLAS backend"
 
 # =============================================================================
+# Backend: gpu (BLAS + CoreML GPU decoder fast path; macOS only)
+# Adds --gpu flag, routing the decoder through coreml_decoder.mm.
+# Needs qwen_decoder_gpu.mlpackage (see ane_proto/export_decoder.py).
+# =============================================================================
+GPU_OBJ = coreml_decoder.o
+ifeq ($(UNAME_S),Darwin)
+gpu: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -DQWEN_GPU
+gpu: LDFLAGS = -lm -lpthread -framework Accelerate -framework CoreML -framework Foundation -lobjc -lc++
+gpu:
+	@$(MAKE) clean
+	@$(MAKE) gpu_link CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
+	@echo ""
+	@echo "Built with GPU (CoreML) decoder — run with --gpu"
+
+gpu_link: $(OBJS) main.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) main.o $(GPU_OBJ) $(LDFLAGS)
+
+$(GPU_OBJ): coreml_decoder.mm coreml_decoder.h
+	clang -fobjc-arc -O3 -c -o $@ coreml_decoder.mm
+else
+gpu:
+	@echo "gpu target is macOS-only (CoreML)"; exit 1
+endif
+
+# =============================================================================
 # Build rules
 # =============================================================================
 $(TARGET): $(OBJS) main.o
@@ -73,7 +99,7 @@ debug:
 # Utilities
 # =============================================================================
 clean:
-	rm -f $(OBJS) main.o $(TARGET)
+	rm -f $(OBJS) main.o $(GPU_OBJ) $(TARGET)
 
 info:
 	@echo "Platform: $(UNAME_S)"
