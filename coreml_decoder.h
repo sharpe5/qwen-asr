@@ -25,13 +25,15 @@ int gpu_dec_init(const char *mlpackage_path);
 /* Start a fresh, zeroed KV cache (one independent chunk). Returns 0 on success. */
 int gpu_dec_reset(void);
 
-/* One decode step.
- *   x:        input hidden state [hidden]         (token embedding)
- *   cos,sin:  NeoX RoPE tables for this position  [head_dim] (duplicated halves)
- *   pos:      absolute position in the cache (0-based; must be < gpu_dec_max())
- *   out:      receives the final-normed hidden     [hidden]
+/* Process S tokens in ONE call (S=N for batched prefill, S=1 for a decode step).
+ *   emb:       [S * hidden]     input embeddings, row-major
+ *   cos,sin:   [S * head_dim]   NeoX RoPE tables per token (duplicated halves)
+ *   positions: [S]              absolute cache position of each token (< gpu_dec_max())
+ *   S:         token count (1 .. gpu_dec_max())
+ *   out:       [S * hidden]     final-normed hidden per token (may be NULL to discard)
  * Returns 0 on success, non-zero on error. */
-int gpu_dec_step(const float *x, const float *cos, const float *sin, int pos, float *out);
+int gpu_dec_chunk(const float *emb, const float *cos, const float *sin,
+                  const int *positions, int S, float *out);
 
 int gpu_dec_hidden(void);    /* model hidden size   (1024) */
 int gpu_dec_head_dim(void);  /* rope head dim       (128)  */

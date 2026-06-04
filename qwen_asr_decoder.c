@@ -278,21 +278,20 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
 
 #ifdef QWEN_GPU
     if (cfg->use_gpu) {
-        /* GPU fast path: feed each prompt embedding through the on-device
-         * stateful decoder to populate the KV cache. Independent chunks
-         * (past_text == no) start at position 0, so reset state there. */
+        /* GPU fast path: BATCHED prefill — populate the KV cache for all
+         * seq_len prompt tokens in ONE on-device forward (weights read once).
+         * Independent chunks (past_text == no) start at 0, so reset there. */
         int start = ctx->kv_cache_len;
         if (start == 0) gpu_dec_reset();
         if (ensure_rope_cache(ctx, start + seq_len, head_dim, theta) != 0) return;
-        float *hid = (float *)malloc((size_t)dim * sizeof(float));
-        if (!hid) return;
-        for (int s = 0; s < seq_len; s++) {
-            int pos = start + s;
-            gpu_dec_step(input_embeds + (size_t)s * dim,
-                         ctx->rope_cache_cos + (size_t)pos * head_dim,
-                         ctx->rope_cache_sin + (size_t)pos * head_dim, pos, hid);
-        }
-        free(hid);
+        int *pos = (int *)malloc((size_t)seq_len * sizeof(int));
+        if (!pos) return;
+        for (int s = 0; s < seq_len; s++) pos[s] = start + s;
+        gpu_dec_chunk(input_embeds,
+                      ctx->rope_cache_cos + (size_t)start * head_dim,
+                      ctx->rope_cache_sin + (size_t)start * head_dim,
+                      pos, seq_len, NULL);  /* hidden not needed for prefill */
+        free(pos);
         ctx->kv_cache_len = start + seq_len;
         return;
     }
@@ -463,9 +462,9 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
         if (ensure_rope_cache(ctx, pos + 1, head_dim, theta) != 0) return QWEN_TOKEN_IM_END;
         float *hid = (float *)malloc((size_t)dim * sizeof(float));
         if (!hid) return QWEN_TOKEN_IM_END;
-        int rc = gpu_dec_step(input_embed,
-                              ctx->rope_cache_cos + (size_t)pos * head_dim,
-                              ctx->rope_cache_sin + (size_t)pos * head_dim, pos, hid);
+        int rc = gpu_dec_chunk(input_embed,
+                               ctx->rope_cache_cos + (size_t)pos * head_dim,
+                               ctx->rope_cache_sin + (size_t)pos * head_dim, &pos, 1, hid);
         if (rc != 0) { free(hid); return QWEN_TOKEN_IM_END; }
         ctx->kv_cache_len = pos + 1;
         int tok = qwen_argmax_matvec_bf16(hid, dec->tok_embeddings_bf16, dim, cfg->vocab_size);

@@ -18,8 +18,10 @@
 
 static MLModel       *g_model = nil;
 static MLState       *g_state = nil;          /* on-device KV cache (macOS 15) */
-static MLMultiArray  *g_x = nil, *g_cos = nil, *g_sin = nil, *g_wmask = nil, *g_amask = nil;
-static MLDictionaryFeatureProvider *g_input = nil;
+
+/* Reused S=1 inputs for the hot per-token decode path (avoids per-call alloc). */
+static MLMultiArray  *g_x1 = nil, *g_cos1 = nil, *g_sin1 = nil, *g_wmask1 = nil, *g_amask1 = nil;
+static MLDictionaryFeatureProvider *g_input1 = nil;
 
 static MLMultiArray *mk(NSArray<NSNumber*> *shape) {
     NSError *e = nil;
@@ -46,22 +48,6 @@ int gpu_dec_init(const char *mlpackage_path) {
 
         g_state = [g_model newState];   /* macOS 15+ stateful KV cache */
         if (!g_state) { NSLog(@"[gpu_dec] newState failed (needs macOS 15+)"); return 3; }
-
-        g_x     = mk(@[@1, @1, @HID]);
-        g_cos   = mk(@[@1, @1, @1, @HDIM]);
-        g_sin   = mk(@[@1, @1, @1, @HDIM]);
-        g_wmask = mk(@[@1, @1, @MAXLEN, @1]);
-        g_amask = mk(@[@1, @1, @1, @MAXLEN]);
-        if (!g_x || !g_cos || !g_sin || !g_wmask || !g_amask) return 4;
-
-        g_input = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{
-            @"x":     [MLFeatureValue featureValueWithMultiArray:g_x],
-            @"cos":   [MLFeatureValue featureValueWithMultiArray:g_cos],
-            @"sin":   [MLFeatureValue featureValueWithMultiArray:g_sin],
-            @"wmask": [MLFeatureValue featureValueWithMultiArray:g_wmask],
-            @"amask": [MLFeatureValue featureValueWithMultiArray:g_amask],
-        } error:&err];
-        if (err) { NSLog(@"[gpu_dec] provider failed: %@", err); return 5; }
         return 0;
     }
 }
@@ -74,32 +60,53 @@ int gpu_dec_reset(void) {
     }
 }
 
-int gpu_dec_step(const float *x, const float *cosv, const float *sinv, int pos, float *out) {
+int gpu_dec_chunk(const float *emb, const float *cosv, const float *sinv,
+                  const int *positions, int S, float *out) {
     @autoreleasepool {
-        if (!g_model || pos < 0 || pos >= MAXLEN) return 1;
-        float *px = (float *)g_x.dataPointer;
-        float *pc = (float *)g_cos.dataPointer;
-        float *ps = (float *)g_sin.dataPointer;
-        float *pw = (float *)g_wmask.dataPointer;
-        float *pa = (float *)g_amask.dataPointer;
-        memcpy(px, x, HID * sizeof(float));
-        memcpy(pc, cosv, HDIM * sizeof(float));
-        memcpy(ps, sinv, HDIM * sizeof(float));
-        for (int j = 0; j < MAXLEN; j++) {
-            pw[j] = (j == pos) ? 1.0f : 0.0f;           /* one-hot write position */
-            pa[j] = (j <= pos) ? 0.0f : -1e9f;          /* causal / validity mask */
+        if (!g_model || S < 1 || S > MAXLEN) return 1;
+        NSError *err = nil;
+        NSNumber *nS = @(S);
+        MLMultiArray *x     = mk(@[@1, nS, @HID]);
+        MLMultiArray *cosa  = mk(@[@1, nS, @HDIM]);
+        MLMultiArray *sina  = mk(@[@1, nS, @HDIM]);
+        MLMultiArray *wmask = mk(@[@MAXLEN, nS]);
+        MLMultiArray *amask = mk(@[@1, @1, nS, @MAXLEN]);
+        if (!x || !cosa || !sina || !wmask || !amask) return 2;
+
+        memcpy((float *)x.dataPointer,    emb,  (size_t)S * HID  * sizeof(float));
+        memcpy((float *)cosa.dataPointer, cosv, (size_t)S * HDIM * sizeof(float));
+        memcpy((float *)sina.dataPointer, sinv, (size_t)S * HDIM * sizeof(float));
+
+        float *pw = (float *)wmask.dataPointer;   /* [MAXLEN, S] row-major */
+        float *pa = (float *)amask.dataPointer;   /* [1,1,S,MAXLEN] row-major */
+        memset(pw, 0, (size_t)MAXLEN * S * sizeof(float));
+        for (int s = 0; s < S; s++) {
+            int pos = positions[s];
+            if (pos < 0 || pos >= MAXLEN) return 3;
+            pw[(size_t)pos * S + s] = 1.0f;                       /* scatter token s -> cache pos */
+            float *row = pa + (size_t)s * MAXLEN;
+            for (int j = 0; j < MAXLEN; j++) row[j] = (j <= pos) ? 0.0f : -1e9f;  /* causal */
         }
 
-        NSError *err = nil;
-        id<MLFeatureProvider> result = [g_model predictionFromFeatures:g_input
-                                                            usingState:g_state
-                                                                 error:&err];
-        if (err || !result) { NSLog(@"[gpu_dec] predict failed: %@", err); return 3; }
+        MLDictionaryFeatureProvider *input =
+            [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{
+                @"x":     [MLFeatureValue featureValueWithMultiArray:x],
+                @"cos":   [MLFeatureValue featureValueWithMultiArray:cosa],
+                @"sin":   [MLFeatureValue featureValueWithMultiArray:sina],
+                @"wmask": [MLFeatureValue featureValueWithMultiArray:wmask],
+                @"amask": [MLFeatureValue featureValueWithMultiArray:amask],
+            } error:&err];
+        if (err) { NSLog(@"[gpu_dec] provider failed: %@", err); return 4; }
 
-        MLFeatureValue *fv = [result featureValueForName:@"hidden"];
-        MLMultiArray *h = fv.multiArrayValue;
-        if (!h) { NSLog(@"[gpu_dec] no 'hidden' output"); return 4; }
-        memcpy(out, (float *)h.dataPointer, HID * sizeof(float));
+        id<MLFeatureProvider> result = [g_model predictionFromFeatures:input
+                                                            usingState:g_state error:&err];
+        if (err || !result) { NSLog(@"[gpu_dec] predict failed: %@", err); return 5; }
+
+        if (out) {
+            MLMultiArray *h = [result featureValueForName:@"hidden"].multiArrayValue;
+            if (!h) { NSLog(@"[gpu_dec] no 'hidden' output"); return 6; }
+            memcpy(out, (float *)h.dataPointer, (size_t)S * HID * sizeof(float));
+        }
         return 0;
     }
 }
@@ -109,5 +116,5 @@ int gpu_dec_head_dim(void) { return HDIM; }
 int gpu_dec_max(void)      { return MAXLEN; }
 
 void gpu_dec_free(void) {
-    g_model = nil; g_state = nil; g_x = g_cos = g_sin = g_wmask = g_amask = nil; g_input = nil;
+    g_model = nil; g_state = nil;
 }
