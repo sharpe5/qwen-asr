@@ -241,6 +241,7 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     ctx->stream_max_new_tokens = 32;
     ctx->past_text_conditioning = 0;
     ctx->skip_silence = 0;
+    ctx->emit_json = 0;
 
     if (qwen_verbose >= 1) fprintf(stderr, "Model loaded.\n");
     return ctx;
@@ -838,6 +839,74 @@ static void segment_emit_cb(const char *piece, void *userdata) {
     st->downstream_cb(piece, st->downstream_userdata);
 }
 
+/* --- JSON output helpers (--json): build {"text":..,"segments":[{start,end,text}]} ---
+ * Timestamps are <sample offset>/16000 in seconds. NOTE: with --skip-silence the offsets
+ * are into the silence-compacted audio, so they are NOT broadcast-aligned; run --json
+ * WITHOUT --skip-silence when real-time timestamps are needed. */
+static void json_raw_append(char **buf, size_t *len, size_t *cap, const char *s) {
+    size_t sl = strlen(s);
+    if (*len + sl + 1 > *cap) {
+        while (*len + sl + 1 > *cap) *cap *= 2;
+        *buf = (char *)realloc(*buf, *cap);
+    }
+    memcpy(*buf + *len, s, sl);
+    *len += sl;
+    (*buf)[*len] = '\0';
+}
+
+/* Append `s` JSON-string-escaped. UTF-8 bytes (>=0x80) pass through unchanged. */
+static void json_escape_append(char **buf, size_t *len, size_t *cap, const char *s) {
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        char tmp[8]; const char *out; size_t ol;
+        switch (*p) {
+            case '"':  out = "\\\""; ol = 2; break;
+            case '\\': out = "\\\\"; ol = 2; break;
+            case '\n': out = "\\n";  ol = 2; break;
+            case '\r': out = "\\r";  ol = 2; break;
+            case '\t': out = "\\t";  ol = 2; break;
+            default:
+                if (*p < 0x20) { snprintf(tmp, sizeof tmp, "\\u%04x", (unsigned)*p); out = tmp; ol = strlen(tmp); }
+                else { tmp[0] = (char)*p; tmp[1] = '\0'; out = tmp; ol = 1; }
+        }
+        if (*len + ol + 1 > *cap) {
+            while (*len + ol + 1 > *cap) *cap *= 2;
+            *buf = (char *)realloc(*buf, *cap);
+        }
+        memcpy(*buf + *len, out, ol);
+        *len += ol;
+        (*buf)[*len] = '\0';
+    }
+}
+
+/* Append one {"start":S,"end":E,"text":"..."} to the segments buffer (comma-separated). */
+static void json_seg_append(char **buf, size_t *len, size_t *cap,
+                            int start_samples, int end_samples, const char *text) {
+    char num[64];
+    if (*len > 0) json_raw_append(buf, len, cap, ",");
+    json_raw_append(buf, len, cap, "{\"start\":");
+    snprintf(num, sizeof num, "%.3f", (double)start_samples / (double)QWEN_SAMPLE_RATE);
+    json_raw_append(buf, len, cap, num);
+    json_raw_append(buf, len, cap, ",\"end\":");
+    snprintf(num, sizeof num, "%.3f", (double)end_samples / (double)QWEN_SAMPLE_RATE);
+    json_raw_append(buf, len, cap, num);
+    json_raw_append(buf, len, cap, ",\"text\":\"");
+    json_escape_append(buf, len, cap, text);
+    json_raw_append(buf, len, cap, "\"}");
+}
+
+/* Wrap full transcript + segments-inner into {"text":..,"segments":[..]}. malloc'd. */
+static char *json_build(const char *full_text, const char *segs_inner) {
+    size_t cap = 256, len = 0;
+    char *j = (char *)malloc(cap);
+    j[0] = '\0';
+    json_raw_append(&j, &len, &cap, "{\"text\":\"");
+    json_escape_append(&j, &len, &cap, full_text ? full_text : "");
+    json_raw_append(&j, &len, &cap, "\",\"segments\":[");
+    json_raw_append(&j, &len, &cap, segs_inner ? segs_inner : "");
+    json_raw_append(&j, &len, &cap, "]}");
+    return j;
+}
+
 char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples) {
     ctx->perf_total_ms = 0;
     ctx->perf_text_tokens = 0;
@@ -892,6 +961,13 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
         char *text = transcribe_segment(ctx, audio_samples, audio_n_samples, tokenizer, NULL, 0, NULL);
         qwen_tokenizer_free(tokenizer);
         free(compacted_samples);
+        if (ctx->emit_json && text) {
+            char *segs = (char *)malloc(64); size_t sl = 0, sc = 64; segs[0] = '\0';
+            if (text[0]) json_seg_append(&segs, &sl, &sc, 0, audio_n_samples, text);
+            char *json = json_build(text, segs);
+            free(segs); free(text);
+            return json;
+        }
         return text;
     }
 
@@ -918,6 +994,9 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
     size_t result_len = 0;
     char *result = (char *)malloc(result_cap);
     result[0] = '\0';
+    /* --json: accumulate per-segment {start,end,text} from the silence-cut offsets. */
+    char *segs = NULL; size_t segs_len = 0, segs_cap = 0;
+    if (ctx->emit_json) { segs_cap = 4096; segs = (char *)malloc(segs_cap); segs[0] = '\0'; }
     int min_samples = QWEN_SAMPLE_RATE / 2; /* 0.5s minimum, like official */
     int do_boundary_cleanup = (ctx->past_text_conditioning != 0);
     int use_past_conditioning = ctx->past_text_conditioning;
@@ -1041,6 +1120,8 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
         memcpy(result + result_len, seg_text + cut_pos, add_len);
         result_len += add_len;
         result[result_len] = '\0';
+        if (ctx->emit_json)
+            json_seg_append(&segs, &segs_len, &segs_cap, core_start, core_end, seg_text + cut_pos);
         if (do_boundary_cleanup && saved_cb) saved_cb(seg_text + cut_pos, saved_cb_userdata);
         free(seg_text);
     }
@@ -1049,6 +1130,12 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
     ctx->token_cb_userdata = saved_cb_userdata;
     qwen_tokenizer_free(tokenizer);
     free(compacted_samples);
+    if (ctx->emit_json) {
+        char *json = json_build(result, segs ? segs : "");
+        free(segs);
+        free(result);
+        return json;
+    }
     return result;
 }
 

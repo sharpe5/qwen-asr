@@ -62,6 +62,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --past-text <yes|no|auto>  Reuse previously decoded text as context for the next\n");
     fprintf(stderr, "                             segment/chunk (continuity bias; auto=yes for --stream)\n");
     fprintf(stderr, "  --skip-silence              Drop long silent spans before inference (off by default)\n");
+    fprintf(stderr, "  --json                      Emit JSON {\"text\":..,\"segments\":[{start,end,text}]} with\n");
+    fprintf(stderr, "                              per-segment silence-cut timestamps (suppresses token streaming;\n");
+    fprintf(stderr, "                              use WITHOUT --skip-silence for broadcast-aligned times)\n");
     fprintf(stderr, "  --prompt <text>            System prompt for biasing (example: \"Preserve spelling: CPU, CUDA, PostgreSQL, Redis\")\n");
     fprintf(stderr, "  --language <lang>          Force output language via token conditioning\n");
     fprintf(stderr, "                             (usually auto-detected if omitted)\n");
@@ -87,6 +90,7 @@ int main(int argc, char **argv) {
     const char *force_language = NULL;
     int past_text_conditioning_mode = -1; /* -1 auto, 0 off, 1 on */
     int skip_silence = 0;
+    int json_output = 0;
     int emit_tokens = 1;
 
     for (int i = 1; i < argc; i++) {
@@ -117,6 +121,8 @@ int main(int argc, char **argv) {
             return 1;
         } else if (strcmp(argv[i], "--skip-silence") == 0) {
             skip_silence = 1;
+        } else if (strcmp(argv[i], "--json") == 0) {
+            json_output = 1;
         } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
             prompt_text = argv[++i];
         } else if (strcmp(argv[i], "--language") == 0 && i + 1 < argc) {
@@ -158,6 +164,7 @@ int main(int argc, char **argv) {
 
     qwen_verbose = verbosity;
     emit_tokens = (verbosity > 0);
+    if (json_output) emit_tokens = 0;  /* clean JSON on stdout: no live token stream */
 
     /* Initialize thread pool */
     if (n_threads <= 0) n_threads = qwen_get_num_cpus();
@@ -187,6 +194,7 @@ int main(int argc, char **argv) {
          * Keep segmented mode default unchanged (off). */
         ctx->past_text_conditioning = 1;
     if (skip_silence) ctx->skip_silence = 1;
+    if (json_output) ctx->emit_json = 1;
     if (prompt_text && qwen_set_prompt(ctx, prompt_text) != 0) {
         fprintf(stderr, "Failed to set --prompt text\n");
         qwen_free(ctx);

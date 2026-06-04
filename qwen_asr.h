@@ -224,6 +224,7 @@ typedef struct {
     int past_text_conditioning;    /* 1=enable past text conditioning in -S/--stream (default: off).
                                     * In segmented mode, this also enables boundary cleanup/post-processing. */
     int skip_silence;              /* 1=drop long silent spans before transcription */
+    int emit_json;                 /* 1=return JSON {text,segments:[{start,end,text}]} (--json) */
 
     /* Optional prompt/language controls */
     char *prompt;                  /* system prompt text (UTF-8) */
