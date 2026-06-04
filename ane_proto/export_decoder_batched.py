@@ -17,6 +17,7 @@ H, NL, NH, NKV, HD = g.H, g.NL, g.NH, g.NKV, g.HD
 QD, MAX = NH * HD, g.MAX
 rms, rotate_half = g.rms, g.rotate_half
 B = int(sys.argv[1]) if len(sys.argv) > 1 else 4
+HIDDEN = (len(sys.argv) > 2 and sys.argv[2] == "hidden")  # output hidden (CPU argmax) vs tok (GPU argmax)
 
 
 class CL(nn.Module):
@@ -67,20 +68,23 @@ class Chunk(nn.Module):
             self.register_buffer(f"kc_{i}", torch.zeros(B, NKV, MAX, HD))
             self.register_buffer(f"vc_{i}", torch.zeros(B, NKV, MAX, HD))
         self.norm = w[f"{g.P}norm.weight"]
-        self.embed = w[f"{g.P}embed_tokens.weight"]
+        if not HIDDEN:
+            self.embed = w[f"{g.P}embed_tokens.weight"]   # tied lm_head (only for GPU-argmax build)
 
     def forward(self, x, cos, sin, wmask, amask):
         rowmask = wmask.sum(2).view(B, 1, MAX, 1)
         for i, layer in enumerate(self.layers):
             x = layer(x, getattr(self, f"kc_{i}"), getattr(self, f"vc_{i}"),
                       cos, sin, wmask, rowmask, amask)
-        hid = rms(x, self.norm)
+        hid = rms(x, self.norm)                           # [B,S,H]
+        if HIDDEN:
+            return hid                                    # CPU argmax in the C engine (throughput)
         logits = F.linear(hid, self.embed)
         return torch.argmax(logits, dim=-1).to(torch.int32)
 
 
 def main():
-    OUT = f"../qwen_decoder_gpu_b{B}.mlpackage"
+    OUT = f"../qwen_decoder_gpu_b{B}{'_hidden' if HIDDEN else ''}.mlpackage"
     w = g.load_w()
     chunk = Chunk(w).eval()
     Sx = 384
@@ -101,11 +105,14 @@ def main():
         ct.TensorType(name="amask", shape=(B, 1, sr, MAX), dtype=np.float32),
     ]
     t0 = time.perf_counter()
-    ml = ct.convert(tr, inputs=inputs, outputs=[ct.TensorType(name="tok")],
+    out_t = (ct.TensorType(name="hidden", dtype=np.float32) if HIDDEN  # C reads fp32 hidden
+             else ct.TensorType(name="tok"))                            # int32 token ids
+    ml = ct.convert(tr, inputs=inputs, outputs=[out_t],
                     states=states, compute_precision=ct.precision.FLOAT16,
                     minimum_deployment_target=ct.target.macOS15)
     ml.save(OUT)
-    print(f"saved {OUT} ({time.perf_counter()-t0:.0f}s) B={B} flexible S=1..{MAX}, GPU lm_head+argmax")
+    print(f"saved {OUT} ({time.perf_counter()-t0:.0f}s) B={B} flexible S=1..{MAX}, "
+          f"{'hidden output (CPU argmax)' if HIDDEN else 'GPU lm_head+argmax'}")
 
 
 if __name__ == "__main__":

@@ -75,6 +75,20 @@ int gpu_decb_prefill(const float *emb, const int *lens, const int *write_lane, i
 int gpu_decb_step(const float *emb, const int *positions,
                   const float *cos, const float *sin, int *out_tok);
 
+/* 1 if the loaded batched model outputs "hidden" (lm_head/argmax done on the CPU,
+ * for throughput) instead of "tok" (argmax fused on the GPU, for single-stream). */
+int gpu_decb_is_hidden(void);
+
+/* Hidden-output variants: same as prefill/step but return the final-normed hidden
+ * vector per lane (out_hidden = [B * hidden]) — the C engine does the lm_head argmax
+ * on the (idle, at high concurrency) CPU. Only valid when gpu_decb_is_hidden().
+ *   prefill_h: out_hidden[b] = hidden at lane b's last real position (lens[b]-1)
+ *   step_h:    out_hidden[b] = hidden at the single decoded position */
+int gpu_decb_prefill_h(const float *emb, const int *lens, const int *write_lane, int Lmax,
+                       const float *cos, const float *sin, float *out_hidden);
+int gpu_decb_step_h(const float *emb, const int *positions,
+                    const float *cos, const float *sin, float *out_hidden);
+
 void gpu_decb_free(void);
 
 #ifdef __cplusplus

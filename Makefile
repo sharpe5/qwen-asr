@@ -1,8 +1,8 @@
 # qwen_asr — Qwen3-ASR Pure C Inference Engine
 # Makefile
 
-CC = gcc
-CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
+CC = zig cc
+CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math -Wno-date-time
 LDFLAGS = -lm -lpthread
 
 # Platform detection

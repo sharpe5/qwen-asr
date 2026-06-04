@@ -1297,6 +1297,10 @@ static char *transcribe_segments_gpu_batched(qwen_ctx_t *ctx, const float *audio
     int *nxt = (int *)malloc((size_t)B * sizeof(int));
     int *newly = (int *)malloc((size_t)B * sizeof(int));
     clane_t *lane = (clane_t *)calloc((size_t)B, sizeof(clane_t));
+    /* Hidden-output model => GPU returns hidden, we argmax on the (idle-at-scale) CPU. */
+    int hid_mode = gpu_decb_is_hidden();
+    int vocab = cfg->vocab_size;
+    float *hidbuf = hid_mode ? (float *)malloc((size_t)B * dim * sizeof(float)) : NULL;
 
     int n_pulled = 0, n_done = 0;
     double decode_ms = 0.0;
@@ -1347,7 +1351,16 @@ static char *transcribe_segments_gpu_batched(qwen_ctx_t *ctx, const float *audio
                 free(lane[b].emb); lane[b].emb = NULL;
             }
             double pt0 = get_time_ms();
-            gpu_decb_prefill(X, lens, wlane, Lmax, ctx->rope_cache_cos, ctx->rope_cache_sin, first);
+            if (hid_mode) {
+                gpu_decb_prefill_h(X, lens, wlane, Lmax, ctx->rope_cache_cos, ctx->rope_cache_sin, hidbuf);
+                for (int i = 0; i < n_newly; i++) {
+                    int b = newly[i];
+                    first[b] = qwen_argmax_matvec_bf16(hidbuf + (size_t)b * dim,
+                                                       ctx->decoder.tok_embeddings_bf16, dim, vocab);
+                }
+            } else {
+                gpu_decb_prefill(X, lens, wlane, Lmax, ctx->rope_cache_cos, ctx->rope_cache_sin, first);
+            }
             decode_ms += get_time_ms() - pt0;
             for (int i = 0; i < n_newly; i++) {
                 int b = newly[i];
@@ -1399,7 +1412,15 @@ static char *transcribe_segments_gpu_batched(qwen_ctx_t *ctx, const float *audio
             memcpy(sinb + (size_t)b * hd, ctx->rope_cache_sin + (size_t)p * hd, (size_t)hd * sizeof(float));
         }
         double st0 = get_time_ms();
-        gpu_decb_step(embstep, positions, cosb, sinb, nxt);
+        if (hid_mode) {
+            gpu_decb_step_h(embstep, positions, cosb, sinb, hidbuf);
+            for (int b = 0; b < B; b++)
+                if (lane[b].active)
+                    nxt[b] = qwen_argmax_matvec_bf16(hidbuf + (size_t)b * dim,
+                                                     ctx->decoder.tok_embeddings_bf16, dim, vocab);
+        } else {
+            gpu_decb_step(embstep, positions, cosb, sinb, nxt);
+        }
         decode_ms += get_time_ms() - st0;
         for (int b = 0; b < B; b++) {
             if (!lane[b].active) continue;
@@ -1447,7 +1468,7 @@ static char *transcribe_segments_gpu_batched(qwen_ctx_t *ctx, const float *audio
     free(pipe.slots);
     free(results); free(rcs); free(rce); free(rcore_done);
     free(X); free(embstep); free(cosb); free(sinb); free(positions); free(lens);
-    free(wlane); free(first); free(nxt); free(newly); free(lane);
+    free(wlane); free(first); free(nxt); free(newly); free(lane); free(hidbuf);
 
     if (ctx->emit_json) {
         char *json = json_build(result, segs ? segs : "");
