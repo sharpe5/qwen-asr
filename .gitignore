@@ -22,3 +22,6 @@ fuzz/findings/
 
 # /ex-fuzz soak reports
 reports/
+
+# Generated CoreML decoder packages (regenerate via ane_proto/export_decoder*.py)
+*.mlpackage/
