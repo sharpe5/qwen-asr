@@ -477,7 +477,7 @@ The detailed BLAS tables below were recomputed on **Apple M3 Max** (128GB RAM) w
 
 ### CPU (BLAS) vs GPU — Apple M3 Ultra
 
-GPU decode (`make gpu`, then `--gpu -S 28`) vs CPU/BLAS offline (`-S 0`), as realtime multiples (higher is faster), measured on an **Apple M3 Ultra** (28-core, 96GB):
+GPU decode (`make gpu`, then `--gpu -S 28`) vs CPU/BLAS offline (`-S 0`), as realtime multiples (higher is faster), **single stream** (one file end to end; CPU runs use 10 threads, `-t 10`), measured on an **Apple M3 Ultra** (28-core, 96GB):
 
 | Clip | Audio | 0.6B CPU | 0.6B GPU | 1.7B CPU | 1.7B GPU |
 |------|-------|----------|----------|----------|----------|
@@ -485,6 +485,75 @@ GPU decode (`make gpu`, then `--gpu -S 28`) vs CPU/BLAS offline (`-S 0`), as rea
 | `119s_…another_broadcast.wav` | 119s | 12.1× | **36.3×** | 7.9× | **25.0×** |
 
 On short clips the GPU's per-segment dispatch overhead makes it a wash; on longer audio its batched multi-segment decode pulls roughly **3× ahead** for both model sizes. (The encoder runs in C either way; `--gpu` accelerates the decoder, and the package is auto-selected from `-d`.)
+
+### Throughput — Clip Length vs Startup
+
+The single-stream table above is **inference-only** realtime× (the engine's `Audio: … realtime`
+line, which excludes process startup). End to end, every run also pays a **fixed startup** — model
+load + CoreML pipeline compile — that doesn't scale with the audio, so the **wall-clock** realtime×
+you actually observe rises with clip length as that startup amortizes. Single stream, `--gpu -t 8
+-S 28`, wall-clock × (includes startup):
+
+| Clip length | 0.6B GPU | 1.7B GPU |
+|-------------|----------|----------|
+| 30s   | 5.3×  | 2.9×  |
+| 45s   | 11.0× | 5.6×  |
+| 89s   | 13.4× | 7.7×  |
+| 119s  | 19.9× | 10.9× |
+| 5 min | 25.9× | 15.7× |
+| 30 min | **32.2×** | **21.7×** |
+
+The startup itself is roughly constant — **~2.8 s for 0.6B, ~6.1 s for 1.7B** (the 1.7B weights are
+larger and its CoreML graph bigger). The steady-state decode ceiling (startup excluded) is about
+**34× (0.6B)** and **23× (1.7B)**; you only approach it on long audio. Practical takeaway: **benchmark
+on files the size of your real workload** — a multi-hour file runs at essentially the steady-state
+rate, a 30 s clip at roughly half it.
+
+### Throughput — Parallel Processes (5-min clip, M3 Ultra 28-core)
+
+For batch work (many files), running several independent `qwen_asr` processes scales much further
+than adding threads to one process — the decoder threads poorly past a few cores, but independent
+streams fill the machine. Aggregate realtime× (summed over all processes, **wall-clock** so startup
+is included), **5-min (300 s) clip**, `-S 28`:
+
+**CPU (BLAS), one thread per process** (`-t 1`) — a single `-t 10` process for reference:
+
+| Processes | 0.6B | 1.7B |
+|-----------|------|------|
+| `-t 10` ×1 (ref) | 12.0× | 7.2× |
+| 1  | 6.0×  | 2.6×  |
+| 2  | 10.9× | 5.1×  |
+| 3  | 13.9× | 7.5×  |
+| 4  | 16.4× | 9.7×  |
+| 6  | 29.3× | 13.2× |
+| 8  | 35.7× | 16.1× |
+| 10 | 39.0× | 17.1× |
+| 12 | **40.4×** | **17.7×** |
+| 14 | 40.4× | 17.7× |
+
+Near-linear to ~8–10 processes, then memory bandwidth + efficiency cores flatten it (~40× / ~18× at
+the plateau). Two `-t 1` processes already beat one `-t 10` process — for throughput, more
+single-thread processes win over more threads on one process.
+
+**GPU (`--gpu --profile throughput -t 2`)** — one shared GPU, so aggregate throughput saturates
+(the "knee"):
+
+| Processes | 0.6B | 1.7B |
+|-----------|------|------|
+| 1 | 19.7× | 11.3× |
+| 2 | 32.5× | 17.3× |
+| 3 | 41.6× | 23.0× |
+| 4 | **46.8×** | **25.2×** |
+| 6 | 47.5× | 23.9× |
+| 8 | 48.1× | 24.7× |
+
+Knee ≈ **4 processes** for both sizes — ~47× (0.6B), ~25× (1.7B); past that the GPU is full and extra
+processes just queue. (Same 5-min clip; longer files lift these further as startup amortizes — see
+the clip-length table above.)
+
+**Rule of thumb (28-core M3 Ultra, 5-min clip):** the saturated GPU (~47× / ~25× at ~4 procs) edges
+out ~12 CPU processes (~40× / ~18×) and frees the CPU besides. The GPU wins on per-stream latency;
+many CPU processes are the GPU-free route to comparable files/hour — and running both at once stacks.
 
 ### Offline Mode (Full + Segmented)
 
