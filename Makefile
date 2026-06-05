@@ -56,7 +56,7 @@ FUZZ_FORKS   ?= 2
 .DEFAULT_GOAL := help
 
 .PHONY: all clean debug info help blas gpu gpu_link test test-gpu test-stream-cache \
-        check-llvm check-model sanitize sanitize-test sanitize-gpu tsan fuzz fuzz-wav fuzz-safetensors fuzz-tokenizer fuzz-mel overnight
+        check-llvm check-model sanitize sanitize-test sanitize-gpu tsan fuzz fuzz-wav fuzz-safetensors fuzz-tokenizer fuzz-mel overnight gpu-model
 
 # Fail early with a clear message if the Homebrew LLVM toolchain is missing.
 check-llvm:
@@ -111,9 +111,21 @@ blas: check-llvm
 # =============================================================================
 # Backend: gpu (BLAS + CoreML GPU decoder fast path; macOS only)
 # Adds --gpu flag, routing the decoder through coreml_decoder.mm.
-# Needs qwen_decoder_gpu.mlpackage (see ane_proto/export_decoder.py).
+# `make gpu` compiles the binary AND generates the CoreML .mlpackage(s) the
+# --gpu path loads, for each downloaded model (see coreml_export/).
 # =============================================================================
 GPU_OBJ = coreml_decoder.o
+
+# CoreML export tooling: `uv run` converts the HF decoder weights into the
+# .mlpackage the binary loads. One package per model size. The export scripts
+# carry their own deps (PEP 723 inline metadata: coremltools/torch + a
+# Python <3.13 pin, since coremltools 9.0's BlobWriter has no wheel for >=3.13);
+# uv provisions a matching interpreter + deps on first run and caches them.
+EXPORT_DIR       = coreml_export
+GPU_MODELS      ?= qwen3-asr-0.6b qwen3-asr-1.7b
+GPU_BATCH       ?= 4
+GPU_FORCE_EXPORT ?=
+
 ifeq ($(UNAME_S),Darwin)
 gpu: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -DQWEN_GPU
 gpu: LDFLAGS = -lm -lpthread -framework Accelerate -framework CoreML -framework Foundation -lobjc -lc++ $(SNDFILE_LIBS)
@@ -122,6 +134,31 @@ gpu: check-llvm
 	@$(MAKE) gpu_link CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
 	@echo ""
 	@echo "Built with GPU (CoreML) decoder — run with --gpu"
+	@$(MAKE) gpu-model
+
+# Generate the CoreML .mlpackage(s) the --gpu path loads, from downloaded HF
+# weights, via `uv run` (interpreter + deps come from each export script's inline
+# PEP 723 metadata; cached after first run). Exports one batched-hidden package
+# per present model size, skipping any that already exist (GPU_FORCE_EXPORT=1 to
+# regenerate). Safe to run standalone. Requires uv: https://docs.astral.sh/uv/.
+gpu-model:
+	@command -v uv >/dev/null || { echo "uv required for GPU model export: brew install uv  (https://docs.astral.sh/uv/)"; exit 1; }
+	@found=0; \
+	for m in $(GPU_MODELS); do \
+	  [ -f "$$m/config.json" ] || continue; found=1; \
+	  tag=$$(echo "$$m" | grep -oE '0\.6b|1\.7b'); \
+	  pkg="qwen_decoder_gpu_$${tag}_b$(GPU_BATCH)_hidden.mlpackage"; \
+	  if [ -d "$$pkg" ] && [ -z "$(GPU_FORCE_EXPORT)" ]; then \
+	    echo "==> $$pkg exists (skip; GPU_FORCE_EXPORT=1 to regenerate)"; \
+	  else \
+	    echo "==> exporting $$pkg from $$m via uv run (first run downloads ~GB; 1.7B takes minutes) ..."; \
+	    ( cd "$(EXPORT_DIR)" && QWEN_MODEL_DIR="$(CURDIR)/$$m" uv run export_decoder_batched.py $(GPU_BATCH) hidden ) || exit 1; \
+	  fi; \
+	done; \
+	if [ $$found -eq 0 ]; then \
+	  echo "==> no model present ($(GPU_MODELS)); run ./download_model.sh first."; \
+	  echo "    Binary is built; --gpu needs a generated package."; \
+	fi
 
 gpu_link: $(OBJS) main.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) main.o $(GPU_OBJ) $(LDFLAGS)
@@ -321,17 +358,25 @@ endif
 # the model dir + qwen_decoder_gpu.mlpackage; if either is absent, SKIP (don't
 # fail). Each sample must exit 0 with non-empty transcription on stdout.
 test-gpu:
-	@if [ ! -d qwen3-asr-0.6b ] || [ ! -d qwen_decoder_gpu.mlpackage ]; then \
-	  echo "==> GPU decode path: SKIP (need qwen3-asr-0.6b + qwen_decoder_gpu.mlpackage)"; exit 0; fi
-	@echo "==> GPU decode path: --gpu over samples (0.6B, segmented -S 28)"
-	@fail=0; n=0; for w in $$(find samples -type f -name '*.wav' | sort); do \
-	  n=$$((n+1)); \
-	  out=$$(./$(TARGET) -d qwen3-asr-0.6b -i "$$w" --gpu -S 28 --silent 2>/dev/null); \
-	  if [ -z "$$out" ]; then echo "  GPU FAIL (empty output): $$w"; fail=1; \
-	  else echo "  GPU ok: $$w"; fi; \
+	@any=0; fail=0; \
+	for m in $(GPU_MODELS); do \
+	  tag=$$(echo "$$m" | grep -oE '0\.6b|1\.7b'); \
+	  pkg="qwen_decoder_gpu_$${tag}_b$(GPU_BATCH)_hidden.mlpackage"; \
+	  if [ ! -d "$$m" ] || [ ! -d "$$pkg" ]; then \
+	    echo "==> GPU decode ($$m): SKIP (need $$m + $$pkg)"; continue; fi; \
+	  any=1; n=0; \
+	  echo "==> GPU decode path ($$m, --gpu -S 28) over samples"; \
+	  for w in $$(find samples -type f -name '*.wav' | sort); do \
+	    n=$$((n+1)); \
+	    out=$$(./$(TARGET) -d "$$m" -i "$$w" --gpu -S 28 --silent 2>/dev/null); \
+	    if [ -z "$$out" ]; then echo "  GPU FAIL (empty output): $$w"; fail=1; \
+	    else echo "  GPU ok: $$w"; fi; \
+	  done; \
+	  echo "  ($$m: $$n samples)"; \
 	done; \
+	if [ $$any -eq 0 ]; then echo "==> GPU decode path: SKIP (no model+package present)"; exit 0; fi; \
 	if [ $$fail -ne 0 ]; then echo "GPU path check FAILED"; exit 1; fi; \
-	echo "GPU path check PASSED ($$n samples)"
+	echo "GPU path check PASSED"
 
 # =============================================================================
 # Dependencies

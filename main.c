@@ -101,8 +101,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --silent      No status output (only final transcription on stdout)\n");
     fprintf(stderr, "                 with -i + --stream, uses non-interactive final refinement\n");
     fprintf(stderr, "  --gpu         Run the decoder on the GPU via CoreML (needs `make gpu`;\n");
-    fprintf(stderr, "                segmented, --past-text no only; 0.6B). Auto-loads\n");
-    fprintf(stderr, "                qwen_decoder_gpu_b4_hidden.mlpackage from the executable's dir.\n");
+    fprintf(stderr, "                segmented, --past-text no only; 0.6B or 1.7B). Auto-loads\n");
+    fprintf(stderr, "                qwen_decoder_gpu_<size>_b4_hidden.mlpackage from the exe dir.\n");
     fprintf(stderr, "  --profile <throughput>   GPU preset (with --gpu): lean encode for many\n");
     fprintf(stderr, "                           concurrent processes (enc-threads 1).\n");
     fprintf(stderr, "  --gpu-model-dir <dir>    Directory holding the .mlpackage (default: exe dir)\n");
@@ -278,25 +278,39 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Error: --gpu requires -S <= 40 (GPU KV cache holds ~512 tokens)\n");
             qwen_free(ctx); return 1;
         }
-        if (ctx->config.dec_hidden != gpu_dec_hidden()) {
-            fprintf(stderr, "Error: --gpu .mlpackage is for the 0.6B model "
-                            "(engine hidden=%d, gpu=%d)\n", ctx->config.dec_hidden, gpu_dec_hidden());
-            qwen_free(ctx); return 1;
-        }
         /* One batched B-lane model serves all --gpu decode (handles 1..B segments).
+         * The default package is chosen to match the engine model size (0.6B
+         * hidden=1024, 1.7B hidden=2048); --gpu-model / env overrides win, and a
+         * post-load hidden check rejects a mismatched .mlpackage.
          * Path: --gpu-model > env (back-compat) > default resolved next to the binary. */
         char mbuf[PATH_MAX];
         const char *mpath = gpu_model_flag;
         if (!mpath) mpath = getenv("QWEN_GPU_BATCH_MODEL");
         if (!mpath) mpath = getenv("QWEN_GPU_MODEL");
-        if (!mpath)
-            mpath = resolve_gpu_model(mbuf, sizeof(mbuf), argv[0], gpu_model_dir,
-                                      "qwen_decoder_gpu_b4_hidden.mlpackage");
-        else if (!strchr(mpath, '/'))   /* bare filename from flag/env -> resolve like the default */
+        if (!mpath) {
+            const char *tag = (ctx->config.dec_hidden == 1024) ? "0.6b"
+                            : (ctx->config.dec_hidden == 2048) ? "1.7b" : NULL;
+            if (!tag) {
+                fprintf(stderr, "Error: --gpu has no package for engine hidden=%d "
+                                "(supported: 0.6B hidden=1024, 1.7B hidden=2048)\n",
+                                ctx->config.dec_hidden);
+                qwen_free(ctx); return 1;
+            }
+            char fname[64];
+            snprintf(fname, sizeof(fname), "qwen_decoder_gpu_%s_b4_hidden.mlpackage", tag);
+            mpath = resolve_gpu_model(mbuf, sizeof(mbuf), argv[0], gpu_model_dir, fname);
+        } else if (!strchr(mpath, '/')) {  /* bare filename from flag/env -> resolve like the default */
             mpath = resolve_gpu_model(mbuf, sizeof(mbuf), argv[0], gpu_model_dir, mpath);
+        }
         if (gpu_decb_init(mpath) != 0) {
             fprintf(stderr, "Error: failed to load GPU model %s\n"
-                            "  (pass --gpu-model <path> or --gpu-model-dir <dir>)\n", mpath);
+                            "  (run `make gpu` to generate it, or pass --gpu-model <path>)\n", mpath);
+            qwen_free(ctx); return 1;
+        }
+        if (gpu_dec_hidden() != ctx->config.dec_hidden) {
+            fprintf(stderr, "Error: --gpu model %s has hidden=%d but the engine model "
+                            "is hidden=%d (wrong-size .mlpackage)\n",
+                            mpath, gpu_dec_hidden(), ctx->config.dec_hidden);
             qwen_free(ctx); return 1;
         }
         ctx->config.use_gpu = 1;

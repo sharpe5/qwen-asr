@@ -13,28 +13,69 @@ Independent chunks (--past-text no contract). Validates first token == C engine.
 
 Usage: python gpu_fast.py [--gpu|--cpu] [max_new]
 """
-import sys, json, struct, time
+import os, sys, json, struct, time
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 import coremltools as ct
 
-MODELDIR = "/Users/t/PyCharmProjects/qwen-asr/qwen3-asr-0.6b"
+# Model dir is configurable so the exporters work for BOTH 0.6B and 1.7B and on
+# any checkout. Order: $QWEN_MODEL_DIR -> repo-root sibling qwen3-asr-0.6b.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODELDIR = os.environ.get("QWEN_MODEL_DIR") or os.path.join(_REPO, "qwen3-asr-0.6b")
 SAFET = f"{MODELDIR}/model.safetensors"
 P = "thinker.model."
-H, NL, NH, NKV, HD, INTER, VOCAB = 1024, 28, 16, 8, 128, 3072, 151936
+
+
+def model_tag(model_dir=MODELDIR):
+    """'0.6b' / '1.7b' from the dir name, for naming the exported .mlpackage."""
+    base = os.path.basename(os.path.normpath(model_dir)).lower()
+    for t in ("0.6b", "1.7b"):
+        if t in base:
+            return t
+    return base or "model"
+
+
+def _decoder_dims(model_dir=MODELDIR):
+    """Decoder (text) dims from config.json -> thinker_config.text_config.
+    The two models differ only in hidden_size and intermediate_size."""
+    with open(f"{model_dir}/config.json") as f:
+        cfg = json.load(f)
+    tc = cfg.get("thinker_config", cfg).get("text_config", cfg)
+    return (tc["hidden_size"], tc["num_hidden_layers"], tc["num_attention_heads"],
+            tc["num_key_value_heads"], tc.get("head_dim", 128),
+            tc["intermediate_size"], tc["vocab_size"])
+
+
+H, NL, NH, NKV, HD, INTER, VOCAB = _decoder_dims()
 QD, KVD = NH*HD, NKV*HD
 EPS, THETA, MAX = 1e-6, 1e6, 512
 EOS = {151643, 151645}
 
-def load_w():
-    with open(SAFET, "rb") as f:
+def _read_safetensors(path, out):
+    """Append BF16 decoder tensors (skip audio_tower) from one .safetensors file."""
+    with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]; hdr = json.loads(f.read(n)); base = f.tell()
-        out = {}
         for k, m in hdr.items():
             if k == "__metadata__" or "audio_tower" in k or m.get("dtype") != "BF16":
                 continue
             s, e = m["data_offsets"]; f.seek(base + s)
             raw = np.frombuffer(f.read(e - s), np.uint16)
             out[k] = torch.from_numpy(((raw.astype(np.uint32) << 16).view(np.float32)).reshape(m["shape"]).copy())
+
+
+def load_w():
+    """Load decoder weights from either a single model.safetensors (0.6B) or a
+    sharded model-0000N-of-*.safetensors set via the index (1.7B)."""
+    out = {}
+    index = f"{MODELDIR}/model.safetensors.index.json"
+    if os.path.exists(SAFET):
+        _read_safetensors(SAFET, out)
+    elif os.path.exists(index):
+        with open(index) as f:
+            shards = sorted(set(json.load(f)["weight_map"].values()))
+        for sh in shards:
+            _read_safetensors(f"{MODELDIR}/{sh}", out)
+    else:
+        raise FileNotFoundError(f"no model.safetensors or shard index in {MODELDIR}")
     return out
 
 

@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11,<3.13"
+# dependencies = ["coremltools==9.0", "torch==2.5.1", "numpy"]
+# ///
+# Run with `uv run export_decoder.py` — uv provisions the interpreter + deps from
+# the metadata above (coremltools 9.0's BlobWriter has no wheel for Python >= 3.13).
 """Export the flexible-sequence GPU decoder (gpu_chunk.Chunk, real weights) to a
 CoreML .mlpackage the C bridge loads. One model serves BOTH batched prefill
 (S=N, one call) and decode (S=1) via a RangeDim sequence axis + matmul-scatter
@@ -9,12 +15,13 @@ Inputs (S = 1..512 flexible): x[1,S,1024] cos[1,S,128] sin[1,S,128]
                               wmask[512,S] amask[1,1,S,512]
 Output: hidden[1,S,1024]   States: kc_0..kc_27, vc_0..vc_27  [1,8,512,128]
 """
-import sys, time
+import os, sys, time
 import numpy as np, torch, coremltools as ct
 import gpu_chunk as gc
 import gpu_fast as g
 
-OUT = sys.argv[1] if len(sys.argv) > 1 else "qwen_decoder_gpu.mlpackage"
+_tag = g.model_tag()
+OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(g._REPO, f"qwen_decoder_gpu_{_tag}.mlpackage")
 H, HD, MAX, NL, NKV = g.H, g.HD, g.MAX, g.NL, g.NKV
 
 w = g.load_w()

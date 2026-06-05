@@ -2,10 +2,11 @@
  * coreml_decoder.mm - Objective-C++ bridge: drives the exported stateful
  * Qwen3-ASR decoder on the GPU (CPU_AND_GPU) for the C engine's --gpu fast path.
  *
- * Model I/O (from ane_proto/export_decoder.py):
- *   inputs : x[1,1,1024] cos[1,1,1,128] sin[1,1,1,128] wmask[1,1,512,1] amask[1,1,1,512]
+ * Model I/O (from coreml_export/export_decoder*.py). Hidden H is read from the
+ * loaded model at init (0.6B=1024, 1.7B=2048); head-dim 128 and cache 512 are fixed:
+ *   inputs : x[B,S,H] cos[B,S,128] sin[B,S,128] wmask[B,512,S] amask[B,1,S,512]
  *   states : kc_0..kc_27, vc_0..vc_27  (on-device KV cache)
- *   output : hidden[1,1024]
+ *   output : hidden[B,S,H]  (or tok[B,S] for the GPU-argmax build)
  */
 #import <Foundation/Foundation.h>
 #import <CoreML/CoreML.h>
@@ -18,6 +19,7 @@
 
 static MLModel       *g_model = nil;
 static MLState       *g_state = nil;          /* on-device KV cache (macOS 15) */
+static int            g_HID = HID;            /* hidden read from the loaded model (0.6B=1024, 1.7B=2048) */
 
 /* Reused S=1 inputs for the hot per-token decode path (avoids per-call alloc). */
 static MLMultiArray  *g_x1 = nil, *g_cos1 = nil, *g_sin1 = nil, *g_wmask1 = nil, *g_amask1 = nil;
@@ -133,7 +135,7 @@ int gpu_dec_chunk(const float *emb, const float *cosv, const float *sinv,
     }
 }
 
-int gpu_dec_hidden(void)   { return HID; }
+int gpu_dec_hidden(void)   { return g_HID; }
 int gpu_dec_head_dim(void) { return HDIM; }
 int gpu_dec_max(void)      { return MAXLEN; }
 
@@ -167,6 +169,8 @@ int gpu_decb_init(const char *mlpackage_path) {
         MLFeatureDescription *xd = g_modelb.modelDescription.inputDescriptionsByName[@"x"];
         g_B = (int)[xd.multiArrayConstraint.shape[0] integerValue];   /* batch from input shape */
         if (g_B < 1) { NSLog(@"[gpu_decb] bad batch %d", g_B); return 3; }
+        g_HID = (int)[xd.multiArrayConstraint.shape[2] integerValue]; /* hidden from x[B,S,H] */
+        if (g_HID < 1) { NSLog(@"[gpu_decb] bad hidden %d", g_HID); return 3; }
         /* "hidden" output => lm_head/argmax happens on the CPU (throughput); else "tok". */
         g_decb_hidden = (g_modelb.modelDescription.outputDescriptionsByName[@"hidden"] != nil);
         g_stateb = [g_modelb newState];
@@ -208,14 +212,14 @@ static id<MLFeatureProvider> decb_prefill_run(const float *emb, const int *lens,
         const int *write_lane, int Lmax, const float *cosv, const float *sinv, NSError **err) {
     int B = g_B;
     NSNumber *nS = @(Lmax);
-    MLMultiArray *x     = mk(@[@(B), nS, @HID]);
+    MLMultiArray *x     = mk(@[@(B), nS, @(g_HID)]);
     MLMultiArray *cosa  = mk(@[@(B), nS, @HDIM]);
     MLMultiArray *sina  = mk(@[@(B), nS, @HDIM]);
     MLMultiArray *wmask = mk(@[@(B), @MAXLEN, nS]);
     MLMultiArray *amask = mk(@[@(B), @1, nS, @MAXLEN]);
     if (!x || !cosa || !sina || !wmask || !amask) return nil;
 
-    memcpy((float *)x.dataPointer, emb, (size_t)B * Lmax * HID * sizeof(float));
+    memcpy((float *)x.dataPointer, emb, (size_t)B * Lmax * g_HID * sizeof(float));
     float *pc = (float *)cosa.dataPointer, *ps = (float *)sina.dataPointer;
     for (int b = 0; b < B; b++) {                 /* positions 0..Lmax-1 shared across lanes */
         memcpy(pc + (size_t)b * Lmax * HDIM, cosv, (size_t)Lmax * HDIM * sizeof(float));
@@ -275,8 +279,8 @@ int gpu_decb_prefill_h(const float *emb, const int *lens, const int *write_lane,
         const float *ph = (const float *)h.dataPointer;
         for (int b = 0; b < g_B; b++) {
             int L = lens[b]; if (L < 1) L = 1; if (L > Lmax) L = Lmax;
-            memcpy(out_hidden + (size_t)b * HID,
-                   ph + ((size_t)b * Lmax + (L - 1)) * HID, HID * sizeof(float));
+            memcpy(out_hidden + (size_t)b * g_HID,
+                   ph + ((size_t)b * Lmax + (L - 1)) * g_HID, g_HID * sizeof(float));
         }
         return 0;
     }
@@ -287,7 +291,7 @@ static id<MLFeatureProvider> decb_step_run(const float *emb, const int *position
         const float *cosv, const float *sinv, NSError **err) {
     int B = g_B;
     if (!g_bx) {
-        g_bx  = mk(@[@(B), @1, @HID]);  g_bcos = mk(@[@(B), @1, @HDIM]);
+        g_bx  = mk(@[@(B), @1, @(g_HID)]);  g_bcos = mk(@[@(B), @1, @HDIM]);
         g_bsin = mk(@[@(B), @1, @HDIM]); g_bwm = mk(@[@(B), @MAXLEN, @1]);
         g_bam = mk(@[@(B), @1, @1, @MAXLEN]);
         if (!g_bx || !g_bcos || !g_bsin || !g_bwm || !g_bam) return nil;
@@ -300,7 +304,7 @@ static id<MLFeatureProvider> decb_step_run(const float *emb, const int *position
         } error:err];
         if (*err) return nil;
     }
-    memcpy((float *)g_bx.dataPointer,   emb,  (size_t)B * HID  * sizeof(float));
+    memcpy((float *)g_bx.dataPointer,   emb,  (size_t)B * g_HID  * sizeof(float));
     memcpy((float *)g_bcos.dataPointer, cosv, (size_t)B * HDIM * sizeof(float));
     memcpy((float *)g_bsin.dataPointer, sinv, (size_t)B * HDIM * sizeof(float));
     float *pw = (float *)g_bwm.dataPointer;    /* [B,MAXLEN,1] */
@@ -337,7 +341,7 @@ int gpu_decb_step_h(const float *emb, const int *positions,
         if (err || !r) { NSLog(@"[gpu_decb] step_h failed: %@", err); return 5; }
         MLMultiArray *h = [r featureValueForName:@"hidden"].multiArrayValue;  /* [B,1,H] */
         if (!h) { NSLog(@"[gpu_decb] no 'hidden' output"); return 6; }
-        memcpy(out_hidden, (const float *)h.dataPointer, (size_t)g_B * HID * sizeof(float));
+        memcpy(out_hidden, (const float *)h.dataPointer, (size_t)g_B * g_HID * sizeof(float));
         return 0;
     }
 }

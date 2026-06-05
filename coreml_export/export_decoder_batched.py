@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11,<3.13"
+# dependencies = ["coremltools==9.0", "torch==2.5.1", "numpy"]
+# ///
+# Run with `uv run export_decoder_batched.py <B> hidden` — uv provisions the
+# interpreter + deps from the metadata above (coremltools 9.0's BlobWriter has no
+# wheel for Python >= 3.13, hence the upper bound). `make gpu` drives this.
 """Export the Lever 3 BATCHED decoder: fixed batch B, flexible S (RangeDim
 1..MAX), lm_head + argmax ON THE GPU. One model serves batched prefill (S=Lmax,
 one call) and batched decode (S=1) for B independent segments (--past-text no).
@@ -8,7 +15,7 @@ Inputs : x[B,S,H] cos[B,S,HD] sin[B,S,HD] wmask[B,MAX,S] amask[B,1,S,MAX]
 Output : tok[B,S] int32   (greedy argmax token id per (lane,position))
 States : kc_0..kc_27, vc_0..vc_27  [B,NKV,MAX,HD]
 """
-import sys, time
+import os, sys, time
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 import coremltools as ct
 import gpu_fast as g
@@ -84,7 +91,10 @@ class Chunk(nn.Module):
 
 
 def main():
-    OUT = f"../qwen_decoder_gpu_b{B}{'_hidden' if HIDDEN else ''}.mlpackage"
+    # Consistent model-tagged name, written to the repo root (where the binary
+    # resolves it): qwen_decoder_gpu_<tag>_b<B>[_hidden].mlpackage
+    tag = g.model_tag()
+    OUT = os.path.join(g._REPO, f"qwen_decoder_gpu_{tag}_b{B}{'_hidden' if HIDDEN else ''}.mlpackage")
     w = g.load_w()
     chunk = Chunk(w).eval()
     Sx = 384

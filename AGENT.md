@@ -95,6 +95,18 @@ From `qwen_load()` and CLI:
   - x86 AVX hot kernels
 - `qwen_asr_kernels_impl.h`
   - architecture dispatch macros
+- `coreml_decoder.mm` / `coreml_decoder.h`
+  - GPU fast path (`--gpu`, macOS): Objective-C++ CoreML bridge running the
+    batched decoder on the Metal GPU. Hidden size is read from the loaded
+    `.mlpackage` at init (0.6B=1024, 1.7B=2048).
+- `coreml_export/`
+  - Python tooling that converts the HF decoder weights into the CoreML
+    `.mlpackage` the `--gpu` path loads. `gpu_fast.py` holds config-driven dims +
+    `load_w()` (single-file or sharded safetensors); `export_decoder_batched.py`
+    writes `qwen_decoder_gpu_<size>_b4_hidden.mlpackage`. Driven by `make gpu`.
+- `experiment_ane/`
+  - Archived Apple Neural Engine research (not shipped; ANE was too slow for
+    single-token decode and fp16 hurt encoder quality). See its README.
 - `asr_regression.py`
   - quality + focused regression checks
 - `download_model.sh`
@@ -102,7 +114,7 @@ From `qwen_load()` and CLI:
 
 ## Build + Run
 
-Build:
+Build (requires Homebrew LLVM clang — `brew install llvm`; used for all targets):
 ```bash
 make blas
 ```
@@ -111,6 +123,17 @@ Optional: `brew install libsndfile` before building enables native `-i` decode o
 Opus/Ogg/FLAC/MP3 (auto-detected by the Makefile via `brew --prefix libsndfile` →
 `-DHAVE_SNDFILE`). Without it the build still works (WAV/stdin only). After a Makefile
 change, prefer `make clean && make <target>` to avoid a stale `qwen_asr_audio.o`.
+
+GPU build (macOS): `make gpu` compiles the CoreML `--gpu` decoder AND generates
+the per-model `.mlpackage`(s) from downloaded weights. Export runs via `uv run`
+(needs `brew install uv`); `coreml_export/`'s scripts carry their deps inline
+(PEP 723: coremltools/torch + a Python <3.13 pin — coremltools 9.0's BlobWriter
+has no wheel for >=3.13), so uv provisions and caches the toolchain with no
+requirements.txt or manual venv. One package per present model
+(`qwen_decoder_gpu_{0.6b,1.7b}_b4_hidden.mlpackage`); existing ones are skipped
+(`GPU_FORCE_EXPORT=1` to regenerate, `make gpu-model` to regenerate without
+recompiling). `--gpu` auto-selects the package by the `-d` model's hidden size.
+The `.mlpackage`s are generated artifacts — git-ignored, never committed.
 
 Smoke run:
 ```bash

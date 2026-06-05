@@ -373,6 +373,13 @@ Per sample, the tool reports two distances:
 
 ## Building
 
+The build uses **Homebrew LLVM clang** for every target (Apple clang and `zig cc`
+lack the libFuzzer/sanitizer runtimes). Install it first:
+
+```bash
+brew install llvm
+```
+
 ```bash
 make blas       # BLAS acceleration (Accelerate on macOS, OpenBLAS on Linux)
 make test       # Run regression checks (requires built binary + model files)
@@ -388,6 +395,77 @@ sudo apt install libopenblas-dev
 # Fedora
 sudo dnf install openblas-devel
 ```
+
+### GPU decode (`make gpu`, macOS)
+
+`make gpu` builds a binary whose decoder runs on the **Metal GPU** via CoreML, and
+also generates the CoreML model(s) it needs from your downloaded weights:
+
+```bash
+brew install uv        # one-time: uv provisions the Python toolchain for export
+make gpu               # compiles the binary + generates a .mlpackage per model present
+```
+
+`make gpu` compiles the engine, then exports one decoder package per downloaded
+model via `coreml_export/` — `qwen_decoder_gpu_0.6b_b4_hidden.mlpackage` and/or
+`qwen_decoder_gpu_1.7b_b4_hidden.mlpackage`. The export scripts declare their own
+dependencies inline (PEP 723), so `uv run` provisions a compatible Python +
+torch/coremltools on first use and caches them — nothing to pip-install. Existing
+packages are skipped (`GPU_FORCE_EXPORT=1` to regenerate; `make gpu-model`
+regenerates without recompiling). The 1.7B export takes a minute or two and
+produces a ~2.6 GB package; these are generated artifacts and are **not** committed.
+
+Run it by adding `--gpu`; the model size is taken from `-d` (no extra flag):
+
+```bash
+./qwen_asr -d qwen3-asr-0.6b -i audio.wav --gpu     # uses the 0.6B package
+./qwen_asr -d qwen3-asr-1.7b -i audio.wav --gpu     # uses the 1.7B package
+```
+
+GPU decode is segmented + `--past-text no` only. Override the auto-selected
+package with `--gpu-model <path>` if needed.
+
+> The Apple **Neural Engine** was evaluated and rejected (too slow for
+> single-token decode; fp16 hurt encoder quality) — see `experiment_ane/`. The
+> shipped GPU path deliberately leaves the ANE free.
+
+## Fuzzing
+
+The parsers that consume **untrusted bytes** — a WAV you didn't author, a model
+file you downloaded — are fuzzed with **libFuzzer + AddressSanitizer + UBSan**
+(the same Homebrew LLVM toolchain the rest of the build uses; Apple clang ships
+no libFuzzer runtime). Four coverage-guided harnesses live in `fuzz/`:
+
+| Harness | Target | What it hunts |
+|---|---|---|
+| `fuzz_wav` | `qwen_parse_wav_buffer()` | RIFF/WAV header fields (sizes, channels, rate, bit depth) flowing into allocation + resampling math — integer overflow / OOB writes |
+| `fuzz_safetensors` | `safetensors_open/data/get_f32/get_bf16_direct()` | header offsets/sizes that lie about tensor extents — out-of-bounds reads against the mmap |
+| `fuzz_mel` | `qwen_mel_spectrogram()` | arbitrary floats incl. NaN/Inf and boundary lengths (0/1/few) through the windowing/FFT/frame-count math |
+| `fuzz_tokenizer` | `qwen_tokenizer_encode/decode()` | adversarial/truncated UTF-8 through byte-level BPE; unchecked token ids read OOB on decode |
+
+```bash
+make fuzz                 # build all four fuzzers (ASan+UBSan)
+make fuzz-wav             # fuzz one target (FUZZ_SECONDS=14400 = 4h default)
+make fuzz-safetensors
+make fuzz-tokenizer
+make fuzz-mel
+make overnight FUZZ_SECONDS=28800   # build + run every target unattended (8h each)
+```
+
+Runs use libFuzzer **fork mode** (`-fork=2`, `-ignore_crashes/timeouts/ooms`) so a
+crash is logged and fuzzing *continues* — an overnight run collects every distinct
+failure instead of stopping at the first. The corpus persists under
+`fuzz/corpus/<target>/` (the WAV target seeds from `samples/*.wav`; others get a
+minimal valid seed), and each unique crash is saved as
+`fuzz/findings/<target>-crash-<hash>`. Reproduce one by re-running the fuzzer on
+that file: `./fuzz/fuzz_wav fuzz/findings/wav-crash-<hash>`.
+
+Harness sources, the libFuzzer dictionary, and small boundary seeds are committed;
+the built fuzzers, corpus, and crash artifacts are generated and git-ignored.
+
+Separately, `make sanitize` builds the **whole engine** under ASan+UBSan, and
+`make sanitize-test` runs the regression suite through it to catch memory errors
+on the normal (non-fuzz) code paths.
 
 ## How Fast Is It?
 
