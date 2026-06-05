@@ -32,6 +32,7 @@ On **Apple Silicon** there is also an optional **GPU mode** (`make gpu`, then `-
   - [Streaming Mode (45s clip, interactive `--stream`)](#streaming-mode-45s-clip-interactive---stream)
   - [Streaming Non-Interactive Path (`--stream --silent`, file input)](#streaming-non-interactive-path---stream---silent-file-input)
   - [Long-file Example (`/tmp/nirvana.wav`, 135s, 0.6B)](#long-file-example-tmpnirvanawav-135s-06b)
+- [Mac: Why Not the Neural Engine (ANE)?](#mac-why-not-the-neural-engine-ane)
 - [Model Architecture](#model-architecture)
 - [Memory Requirements](#memory-requirements)
   - [Static Footprint (Model Load)](#static-footprint-model-load)
@@ -154,8 +155,9 @@ See [GPU Mode (`--gpu`)](#gpu-mode---gpu) for the runtime constraints and tuning
 flags, and [How Fast Is It?](#how-fast-is-it) for measured numbers.
 
 > The Apple **Neural Engine** was evaluated and rejected (too slow for
-> single-token decode; fp16 hurt encoder quality) — see `experiment_ane/`. The
-> shipped GPU path deliberately leaves the ANE free.
+> single-token decode; fp16 hurt encoder quality) — the shipped GPU path
+> deliberately leaves the ANE free. See [Mac: Why Not the Neural Engine
+> (ANE)?](#mac-why-not-the-neural-engine-ane) for the full story.
 
 ## Usage
 
@@ -593,6 +595,34 @@ For file input, `--stream --silent` does not run interactive chunk commits: it e
 |------|--------|
 | `--stream` | `141.3s` inference (`0.96x` realtime) |
 | offline segmented mode (`-S 30` in this measurement) | `14.0s` inference (`9.64x` realtime) |
+
+## Mac: Why Not the Neural Engine (ANE)?
+
+The obvious question on Apple Silicon is: why does `--gpu` target the **Metal GPU**
+and not the **Neural Engine (ANE)**, the chip's dedicated ML accelerator? We tried
+the ANE first, and it lost on both axes. The research that reached this conclusion
+is archived in `experiment_ane/` (benchmarks and fidelity probes); the short version:
+
+1. **Too slow for single-token decode.** Decoding is autoregressive — one token at
+   a time (`seq_q = 1`), 28 sequential decoder layers per step. The ANE is built for
+   large, batched matmuls; on the tiny per-step dispatch our workload generates, its
+   launch latency lost to both CPU and GPU. Per-step benchmarks comparing `CPU_ONLY`,
+   `CPU_AND_GPU`, and `CPU_AND_NE` consistently put the **GPU ahead**.
+
+2. **fp16 precision hurt encoder quality.** The ANE runs fp16. On the audio encoder
+   that degraded the output enough to matter, and the only way to recover fidelity was
+   to promote selected ops back to fp32 — which then fall to the **CPU** under
+   `CPU_AND_NE`, so the supposed ANE speed win evaporated. The "high-precision ANE"
+   experiments chased exactly this and confirmed the trade-off wasn't worth it.
+
+So the ANE was neither fast enough (single-token decode) nor accurate enough (fp16
+encoder) to beat the GPU. The shipped path therefore runs the decoder on the GPU
+(`MLComputeUnitsCPUAndGPU`) and keeps the encoder in portable C — deliberately
+**leaving the ANE free** for other processes on the machine. The 30-minute audio
+clips and reference encoder outputs used for these measurements are checked into
+`experiment_ane/`; the scripts are archival and unmaintained (some hardcode absolute
+paths). The supported export tooling now lives in `coreml_export/`, driven by
+`make gpu`.
 
 ## Model Architecture
 
