@@ -1,20 +1,63 @@
 # Qwen3-ASR Pure C Implementation
 
-This is a C implementation of the inference pipeline for [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) speech-to-text models (both 0.6B and 1.7B). It has zero external dependencies beyond the C standard library and a BLAS implementation (Accelerate on macOS, OpenBLAS on Linux). Tokens stream to stdout as they are generated. The implementation runs at speed multiple of the file length even in very modest hardware, like low end Intel or AMD processor.
+This is a C implementation of the inference pipeline for [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) speech-to-text models (both 0.6B and 1.7B). It has zero external dependencies beyond the C standard library and a BLAS implementation (Accelerate on macOS, OpenBLAS on Linux). Tokens stream to stdout as they are generated. The implementation runs at a speed multiple of the file length even on very modest hardware, like a low-end Intel or AMD processor.
 
-**Important**: this implementation explicitly **avoids implementing support for MPS**. Transcription systems are very important pieces of infrastructure, and are often run on remote Linux servers. Adding the MPS target would focus the efforts too much on Apple hardware, so for now I'm skipping it. The code runs very well anyway on Apple hardware (NEON optimized). Please, **don't send pull requests** about this feature, fork the code instead, in order to add MPS support. I'll add it much later when the other optimizations are already mature.
+On **Apple Silicon** there is also an optional **GPU mode** (`make gpu`, then `--gpu`): the Qwen3 decoder runs on the **Metal GPU** through CoreML while the encoder stays in portable C. It works for both model sizes, is selected automatically from `-d`, and on longer audio decodes roughly **3× faster** than the CPU path (measured on an M3 Ultra). The CPU/BLAS backend remains the default, and is the only backend you need off macOS.
 
-## Supported modes and models
+**Important**: this implementation explicitly **avoids implementing support for MPS**. Transcription systems are very important pieces of infrastructure, and are often run on remote Linux servers. Adding the MPS target would focus the efforts too much on Apple hardware, so for now I'm skipping it. The code runs very well anyway on Apple hardware (NEON optimized). Please, **don't send pull requests** about this feature, fork the code instead, in order to add MPS support. I'll add it much later when the other optimizations are already mature. (The optional `--gpu` decoder above is a thin CoreML bridge, not a hand-written MPS compute backend — the core engine stays portable C.)
 
-Both normal (offline) and streaming (online) modes are supported. Normal mode defaults to full offline decode (`-S 0`), so the whole audio is encoded at once. Streaming mode processes audio in 2-second chunks with prefix rollback (it keeps the last few decoded tokens as context for the decoder/LLM when transcribing the next chunk).
+## Table of Contents
+
+- [Supported Modes and Models](#supported-modes-and-models)
+- [Quick Start](#quick-start)
+- [Features](#features)
+- [Building](#building)
+  - [GPU Decode (`make gpu`, macOS)](#gpu-decode-make-gpu-macos)
+- [Usage](#usage)
+  - [Normal Mode (Default)](#normal-mode-default)
+  - [Which Mode To Use (By File Length)](#which-mode-to-use-by-file-length)
+  - [GPU Mode (`--gpu`)](#gpu-mode---gpu)
+  - [Streaming Mode (`--stream`)](#streaming-mode---stream)
+  - [Monitor Mode (`--monitor`)](#monitor-mode---monitor)
+  - [Segment Splitting (`-S`)](#segment-splitting--s)
+  - [Silence Skipping (`--skip-silence`)](#silence-skipping---skip-silence)
+  - [JSON Output (`--json`)](#json-output---json)
+  - [Language (`--language`)](#language---language)
+  - [System Prompt (`--prompt`)](#system-prompt---prompt)
+  - [Reading Audio from Stdin](#reading-audio-from-stdin)
+  - [C API](#c-api)
+- [How Fast Is It?](#how-fast-is-it)
+  - [CPU (BLAS) vs GPU — Apple M3 Ultra](#cpu-blas-vs-gpu--apple-m3-ultra)
+  - [Throughput — Clip Length vs Startup](#throughput--clip-length-vs-startup)
+  - [Throughput — Parallel Processes (5-min clip, M3 Ultra 28-core)](#throughput--parallel-processes-5-min-clip-m3-ultra-28-core)
+  - [Offline Mode (Full + Segmented)](#offline-mode-full--segmented)
+  - [Streaming Mode (45s clip, interactive `--stream`)](#streaming-mode-45s-clip-interactive---stream)
+  - [Streaming Non-Interactive Path (`--stream --silent`, file input)](#streaming-non-interactive-path---stream---silent-file-input)
+  - [Long-file Example (`/tmp/nirvana.wav`, 135s, 0.6B)](#long-file-example-tmpnirvanawav-135s-06b)
+- [Model Architecture](#model-architecture)
+- [Memory Requirements](#memory-requirements)
+  - [Static Footprint (Model Load)](#static-footprint-model-load)
+  - [Runtime Scaling (Why `-S 0` Grows)](#runtime-scaling-why--s-0-grows)
+  - [Measured Peak RSS (`--silent`)](#measured-peak-rss---silent)
+- [Development & Testing](#development--testing)
+  - [Regression Tests](#regression-tests)
+  - [Fuzzing](#fuzzing)
+- [License](#license)
+
+## Supported Modes and Models
+
+Both **normal (offline)** and **streaming (online)** modes are supported. Normal mode defaults to full offline decode (`-S 0`), so the whole audio is encoded at once. Streaming mode processes audio in 2-second chunks with prefix rollback (it keeps the last few decoded tokens as context for the decoder/LLM when transcribing the next chunk).
 
 *Important practical note*: in this implementation, interactive `--stream` prioritizes incremental token stability over throughput and can be much slower than normal mode when you process an already-recorded file end-to-end.
 
 Audio can be piped from stdin (`--stdin`), making it easy to transcode and transcribe any format via ffmpeg. Language is usually auto-detected from audio, and can be forced with `--language`. A system prompt can bias the model toward specific terms or spellings.
 
-Both the 0.6B and 1.7B parameters models are supported. While the 1.7B model is generally more powerful, the 0.6B model seems the sweet spot for CPU inference, however the speed difference is not huge, so you may want to try both and decide what to use depending on your use case.
+Both the **0.6B and 1.7B** parameter models are supported. While the 1.7B model is generally more powerful, the 0.6B model seems the sweet spot for CPU inference; the speed difference is not huge, so you may want to try both and decide based on your use case.
 
-Two execution backends are available: **CPU/BLAS** (the default, `make blas`, cross-platform) and, on Apple Silicon, a **GPU** decoder (`make gpu` + `--gpu`) that runs the Qwen3 decoder on the Metal GPU via CoreML. The GPU path works for both model sizes and is selected automatically from `-d` — see [Building](#building) and [How Fast Is It?](#how-fast-is-it) for measured M3 Ultra numbers.
+Two execution backends are available:
+
+- **CPU / BLAS** — the default (`make blas`), cross-platform (Accelerate on macOS, OpenBLAS on Linux), with architecture-specific SIMD (NEON / AVX).
+- **GPU** (Apple Silicon only) — `make gpu` + `--gpu` runs the Qwen3 decoder on the **Metal GPU** via CoreML. It works for both model sizes and is selected automatically from `-d`. See [Building](#building) and [How Fast Is It?](#how-fast-is-it) for measured M3 Ultra numbers.
 
 ## Quick Start
 
@@ -40,11 +83,12 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 ## Features
 
 - **Almost zero dependencies**: Pure C implementation. Needs BLAS (Accelerate on macOS, OpenBLAS on Linux); optional libsndfile enables Opus/Ogg/FLAC/MP3 input.
-- **Two backends — CPU (BLAS) and GPU**: `make blas` runs entirely on the CPU via BLAS, everywhere. On Apple Silicon, `make gpu` additionally runs the decoder on the **Metal GPU** via CoreML (`--gpu`), for both the 0.6B and 1.7B models — measured on an Apple **M3 Ultra**. See [Building](#building).
+- **Two backends — CPU (BLAS) and GPU**: `make blas` runs entirely on the CPU via BLAS, everywhere. On Apple Silicon, `make gpu` additionally runs the decoder on the **Metal GPU** via CoreML (`--gpu`), for both the 0.6B and 1.7B models. See [Building](#building).
 - **Both models**: Automatically detects Qwen3-ASR-0.6B or 1.7B from the weight files.
 - **Streaming output**: Tokens are printed to stdout as they are generated, word by word, even in offline mode (no `--stream`).
 - **Streaming mode**: `--stream` processes audio in chunks with prefix rollback. A sliding window bounds encoder and decoder context for indefinite streaming.
 - **Monitor mode**: `--monitor` shows inline Unicode symbols on stderr for real-time pipeline diagnostics.
+- **JSON output**: `--json` emits a structured transcript with per-segment timestamps.
 - **Language control**: `--language Italian` forces the target language (otherwise it is usually auto-detected).
 - **Prompt biasing**: `--prompt` injects a system prompt to bias the model toward specific terms or spellings. Note that prompt biasing is very soft. The models may or may not care about your instructions. Usually spelling instructions are followed decently.
 - **Optional silence skipping**: `--skip-silence` drops long silent spans before inference (off by default). It may use less CPU for the same file.
@@ -52,6 +96,68 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 - **File input**: 16-bit PCM WAV at any sample rate (auto-resampled to 16kHz); also Opus/Ogg/FLAC/MP3 via `-i` when built with libsndfile.
 - **Stdin input**: Reads from stdin with auto-detection (WAV header or raw s16le 16kHz mono).
 - **Optional segment splitting**: use `-S 20` / `-S 30` for large files with segment-cutting silence search (`-W 3`).
+
+## Building
+
+The build uses **Homebrew LLVM clang** for every target (Apple clang and `zig cc`
+lack the libFuzzer/sanitizer runtimes). Install it first:
+
+```bash
+brew install llvm
+```
+
+```bash
+make blas       # BLAS acceleration (Accelerate on macOS, OpenBLAS on Linux)
+make test       # Run regression checks (requires built binary + model files)
+make test-stream-cache  # Check stream cache on/off equivalence
+make clean      # Clean build artifacts
+```
+
+For Linux, install OpenBLAS first:
+```bash
+# Ubuntu/Debian
+sudo apt install libopenblas-dev
+
+# Fedora
+sudo dnf install openblas-devel
+```
+
+Optional: `brew install libsndfile` before building enables native `-i` decode of
+Opus/Ogg/FLAC/MP3 (auto-detected by the Makefile). Without it the build still works
+(WAV and stdin only).
+
+### GPU Decode (`make gpu`, macOS)
+
+`make gpu` builds a binary whose decoder runs on the **Metal GPU** via CoreML, and
+also generates the CoreML model(s) it needs from your downloaded weights:
+
+```bash
+brew install uv        # one-time: uv provisions the Python toolchain for export
+make gpu               # compiles the binary + generates a .mlpackage per model present
+```
+
+`make gpu` compiles the engine, then exports one decoder package per downloaded
+model via `coreml_export/` — `qwen_decoder_gpu_0.6b_b4_hidden.mlpackage` and/or
+`qwen_decoder_gpu_1.7b_b4_hidden.mlpackage`. The export scripts declare their own
+dependencies inline (PEP 723), so `uv run` provisions a compatible Python +
+torch/coremltools on first use and caches them — nothing to pip-install. Existing
+packages are skipped (`GPU_FORCE_EXPORT=1` to regenerate; `make gpu-model`
+regenerates without recompiling). The 1.7B export takes a minute or two and
+produces a ~2.6 GB package; these are generated artifacts and are **not** committed.
+
+Run it by adding `--gpu`; the model size is taken from `-d` (no extra flag):
+
+```bash
+./qwen_asr -d qwen3-asr-0.6b -i audio.wav --gpu     # uses the 0.6B package
+./qwen_asr -d qwen3-asr-1.7b -i audio.wav --gpu     # uses the 1.7B package
+```
+
+See [GPU Mode (`--gpu`)](#gpu-mode---gpu) for the runtime constraints and tuning
+flags, and [How Fast Is It?](#how-fast-is-it) for measured numbers.
+
+> The Apple **Neural Engine** was evaluated and rejected (too slow for
+> single-token decode; fp16 hurt encoder quality) — see `experiment_ane/`. The
+> shipped GPU path deliberately leaves the ANE free.
 
 ## Usage
 
@@ -84,7 +190,7 @@ For very long files, decoder cost still grows with sequence history. Use `--stre
 - **Up to ~60s**: use `-S 0` (which is the default) for best quality if speed is acceptable.
 - **Large prerecorded files**: use segmented offline mode, e.g. `-S 20` (or `-S 30`, or even more).
 - **Long live/continuous audio or low-latency UI needs**: use `--stream`.
-- **Batch/offline file transcription**: prefer `-S 20`/`-S 30`; it is usually much faster than interactive `--stream`.
+- **Batch/offline file transcription**: prefer `-S 20`/`-S 30`; it is usually much faster than interactive `--stream`. On Apple Silicon, add `--gpu` for the decoder.
 - **If segmented output drops/warps around boundaries**: try a different segment size and keep default `--past-text auto`.
 - **If you want stronger continuity across segments/chunks**: try `--past-text yes` (can help continuity, can also cause drift on some files).
 
@@ -92,6 +198,44 @@ Large-file tradeoff summary:
 - `-S 20`: offline segmented decode, usually best throughput on long files, stable memory, and token-by-token output.
 - `-S 20 --past-text yes`: buffered per-segment output with boundary cleanup and continuity bias.
 - `--stream`: incremental output while audio arrives, lower interaction latency, but usually higher total compute for full prerecorded files.
+
+### GPU Mode (`--gpu`)
+
+On Apple Silicon, after building with `make gpu`, add `--gpu` to run the Qwen3
+decoder on the **Metal GPU** via CoreML (the encoder still runs in C). The correct
+`.mlpackage` is auto-selected from `-d` (0.6B or 1.7B):
+
+```bash
+./qwen_asr -d qwen3-asr-0.6b -i audio.wav --gpu
+```
+
+GPU mode is built for **segmented batch decode**, so a few constraints apply:
+
+- It is **segmented only**. If you don't pass `-S`, it defaults to `-S 28`; the max is `-S 40` (the GPU KV cache holds ~512 tokens).
+- It is **`--past-text no` only** (chunks are decoded independently for parallelism); `--past-text yes` is rejected.
+- It is **not** compatible with `--stream`.
+
+For batch throughput, run several processes in parallel (one file each) with the
+`throughput` profile, which trims encoder threads so the processes don't
+oversubscribe the CPU:
+
+```bash
+# transcribe many files, 4 at a time, each on the GPU
+printf '%s\n' *.opus | xargs -P4 -I{} \
+    ./qwen_asr -d qwen3-asr-0.6b -i {} --gpu --profile throughput -t 2 --silent
+```
+
+GPU tuning flags (all optional):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--profile throughput` | — | Preset for running many concurrent processes (lean encode, `enc-threads 1`) |
+| `--gpu-model-dir <dir>` | exe dir | Directory to find the `.mlpackage` in |
+| `--gpu-model <path>` | auto | Explicit `.mlpackage` path (overrides auto-selection) |
+| `--gpu-refill-min <n>` | 3 | Batched-scheduler refill threshold (`1..B`) |
+| `--gpu-enc-threads <n>` | 4 | Encoder worker threads (`1..16`) |
+
+See [How Fast Is It?](#how-fast-is-it) for single-stream vs parallel-process numbers and where the throughput "knee" sits.
 
 ### Streaming Mode (`--stream`)
 
@@ -211,6 +355,24 @@ Tradeoffs:
 - Can slightly alter timing-sensitive boundary behavior and punctuation.
 - Disabled by default to preserve baseline behavior.
 
+### JSON Output (`--json`)
+
+```bash
+./qwen_asr -d qwen3-asr-0.6b -i lecture.wav -S 20 --json
+```
+
+Emits a structured transcript instead of streaming raw tokens:
+
+```json
+{"text": "...full transcript...",
+ "segments": [{"start": 0.0, "end": 19.8, "text": "..."}, ...]}
+```
+
+`start`/`end` are the per-segment silence-cut timestamps (in seconds). `--json`
+suppresses token-by-token streaming (the whole object is printed when decoding
+finishes). For timestamps aligned to the original broadcast/recording timeline,
+use `--json` **without** `--skip-silence` (silence skipping changes the time base).
+
 ### Language (`--language`)
 
 ```bash
@@ -316,164 +478,13 @@ free(samples);
 
 Tokens are emitted via the callback as they become "fixed" (past the rollback window). The returned string contains the full concatenated text.
 
-## Regression Tests
-
-The repository includes `asr_regression.py` (repo root), a stdlib-only regression harness.
-It scans `samples/**/*.wav` recursively:
-- quality regression runs on WAV files that already have a sibling `.txt` reference
-- focused checks (segmented conditioning, streaming, stream-cache equivalence) use fixed targets
-
-Generate references (using the larger model and full-context decode):
-
-```bash
-./asr_regression.py --generate-missing \
-    --binary ./qwen_asr --model-dir qwen3-asr-1.7b
-```
-
-Run regression checks:
-
-```bash
-./asr_regression.py \
-    --binary ./qwen_asr --model-dir qwen3-asr-1.7b
-```
-
-Or run the default regression profile via make:
-
-```bash
-make test
-```
-
-Streaming cache equivalence regression (cache on vs off):
-
-```bash
-./asr_regression.py --stream-cache-check-only \
-    --binary ./qwen_asr --stream-cache-model-dir qwen3-asr-0.6b
-```
-
-Or via make:
-
-```bash
-make test-stream-cache
-```
-
-Output format:
-- Each sample starts with a progress line: `START i/N`.
-- Live model text is shown while that sample is transcribed.
-- The sample closes with `DONE: OK i/N` (only `OK` is green) or `DONE: FAIL i/N` (status in red).
-
-Example:
-
-```text
-[START 1/22] jfk.wav ...
-And so, my fellow Americans, ask not what your country can do for you...
-[DONE: OK 1/22] jfk.wav | exact 0/108 (0.000) | norm 0/104 (0.000) | 2.6s
-```
-
-Per sample, the tool reports two distances:
-- `exact`: character-level Levenshtein distance on raw text.
-- `norm`: character-level Levenshtein distance after normalization
-  (punctuation -> spaces, lowercase, whitespace collapsed).
-
-## Building
-
-The build uses **Homebrew LLVM clang** for every target (Apple clang and `zig cc`
-lack the libFuzzer/sanitizer runtimes). Install it first:
-
-```bash
-brew install llvm
-```
-
-```bash
-make blas       # BLAS acceleration (Accelerate on macOS, OpenBLAS on Linux)
-make test       # Run regression checks (requires built binary + model files)
-make test-stream-cache  # Check stream cache on/off equivalence
-make clean      # Clean build artifacts
-```
-
-For Linux, install OpenBLAS first:
-```bash
-# Ubuntu/Debian
-sudo apt install libopenblas-dev
-
-# Fedora
-sudo dnf install openblas-devel
-```
-
-### GPU decode (`make gpu`, macOS)
-
-`make gpu` builds a binary whose decoder runs on the **Metal GPU** via CoreML, and
-also generates the CoreML model(s) it needs from your downloaded weights:
-
-```bash
-brew install uv        # one-time: uv provisions the Python toolchain for export
-make gpu               # compiles the binary + generates a .mlpackage per model present
-```
-
-`make gpu` compiles the engine, then exports one decoder package per downloaded
-model via `coreml_export/` — `qwen_decoder_gpu_0.6b_b4_hidden.mlpackage` and/or
-`qwen_decoder_gpu_1.7b_b4_hidden.mlpackage`. The export scripts declare their own
-dependencies inline (PEP 723), so `uv run` provisions a compatible Python +
-torch/coremltools on first use and caches them — nothing to pip-install. Existing
-packages are skipped (`GPU_FORCE_EXPORT=1` to regenerate; `make gpu-model`
-regenerates without recompiling). The 1.7B export takes a minute or two and
-produces a ~2.6 GB package; these are generated artifacts and are **not** committed.
-
-Run it by adding `--gpu`; the model size is taken from `-d` (no extra flag):
-
-```bash
-./qwen_asr -d qwen3-asr-0.6b -i audio.wav --gpu     # uses the 0.6B package
-./qwen_asr -d qwen3-asr-1.7b -i audio.wav --gpu     # uses the 1.7B package
-```
-
-GPU decode is segmented + `--past-text no` only. Override the auto-selected
-package with `--gpu-model <path>` if needed.
-
-> The Apple **Neural Engine** was evaluated and rejected (too slow for
-> single-token decode; fp16 hurt encoder quality) — see `experiment_ane/`. The
-> shipped GPU path deliberately leaves the ANE free.
-
-## Fuzzing
-
-The parsers that consume **untrusted bytes** — a WAV you didn't author, a model
-file you downloaded — are fuzzed with **libFuzzer + AddressSanitizer + UBSan**
-(the same Homebrew LLVM toolchain the rest of the build uses; Apple clang ships
-no libFuzzer runtime). Four coverage-guided harnesses live in `fuzz/`:
-
-| Harness | Target | What it hunts |
-|---|---|---|
-| `fuzz_wav` | `qwen_parse_wav_buffer()` | RIFF/WAV header fields (sizes, channels, rate, bit depth) flowing into allocation + resampling math — integer overflow / OOB writes |
-| `fuzz_safetensors` | `safetensors_open/data/get_f32/get_bf16_direct()` | header offsets/sizes that lie about tensor extents — out-of-bounds reads against the mmap |
-| `fuzz_mel` | `qwen_mel_spectrogram()` | arbitrary floats incl. NaN/Inf and boundary lengths (0/1/few) through the windowing/FFT/frame-count math |
-| `fuzz_tokenizer` | `qwen_tokenizer_encode/decode()` | adversarial/truncated UTF-8 through byte-level BPE; unchecked token ids read OOB on decode |
-
-```bash
-make fuzz                 # build all four fuzzers (ASan+UBSan)
-make fuzz-wav             # fuzz one target (FUZZ_SECONDS=14400 = 4h default)
-make fuzz-safetensors
-make fuzz-tokenizer
-make fuzz-mel
-make overnight FUZZ_SECONDS=28800   # build + run every target unattended (8h each)
-```
-
-Runs use libFuzzer **fork mode** (`-fork=2`, `-ignore_crashes/timeouts/ooms`) so a
-crash is logged and fuzzing *continues* — an overnight run collects every distinct
-failure instead of stopping at the first. The corpus persists under
-`fuzz/corpus/<target>/` (the WAV target seeds from `samples/*.wav`; others get a
-minimal valid seed), and each unique crash is saved as
-`fuzz/findings/<target>-crash-<hash>`. Reproduce one by re-running the fuzzer on
-that file: `./fuzz/fuzz_wav fuzz/findings/wav-crash-<hash>`.
-
-Harness sources, the libFuzzer dictionary, and small boundary seeds are committed;
-the built fuzzers, corpus, and crash artifacts are generated and git-ignored.
-
-Separately, `make sanitize` builds the **whole engine** under ASan+UBSan, and
-`make sanitize-test` runs the regression suite through it to catch memory errors
-on the normal (non-fuzz) code paths.
-
 ## How Fast Is It?
 
-The detailed BLAS tables below were recomputed on **Apple M3 Max** (128GB RAM) with `make blas` (single run per row).
-`Inference`/`Audio` are from program summary. `wall` includes model-load and process overhead.
+Speeds are reported as **realtime multiples** (higher is faster): a `10×` figure means
+ten seconds of audio per second of wall time. The headline tables below were measured
+on an **Apple M3 Ultra** (28-core, 96GB); the detailed BLAS tables further down were
+recomputed on an **Apple M3 Max** (128GB). `Inference`/`Audio` come from the program's
+own summary lines; `wall` includes model-load and process overhead.
 
 ### CPU (BLAS) vs GPU — Apple M3 Ultra
 
@@ -557,6 +568,8 @@ many CPU processes are the GPU-free route to comparable files/hour — and runni
 
 ### Offline Mode (Full + Segmented)
 
+Measured on **Apple M3 Max** (128GB) with `make blas` (single run per row).
+
 | Setup | Audio | 0.6B (`Inference`, realtime, wall) | 1.7B (`Inference`, realtime, wall) |
 |-------|-------|-------------------------------------|-------------------------------------|
 | `samples/jfk.wav -S 0` | `11.0s` | `1.4s`, `7.99x`, `1.83s` | `2.6s`, `4.29x`, `3.17s` |
@@ -609,6 +622,10 @@ WAV -> 16kHz -> Mel Spectrogram -> Conv2D Stem -> Encoder -> Projection -> Decod
 | Vocab size | 151,936 | 151,936 |
 | Weight format | BF16 | BF16 |
 | Supported languages | 30 (see `--language`) |
+
+On Apple Silicon, the `--gpu` path moves the **LLM Decoder** onto the Metal GPU
+(CoreML, hidden size read from the loaded `.mlpackage`); everything upstream — mel,
+Conv2D stem, encoder, projection — stays in C. See [GPU Decode](#gpu-decode-make-gpu-macos).
 
 ## Memory Requirements
 
@@ -667,6 +684,104 @@ In practice:
 - For long files, segmented mode is safer for both speed and memory.
 - Default is `-S 0`, so for large files explicitly pick segmented mode (`-S 20` or `-S 30`).
 - Use `-S 0` mainly for short files where full-context quality is worth the extra memory/time.
+
+## Development & Testing
+
+### Regression Tests
+
+The repository includes `asr_regression.py` (repo root), a stdlib-only regression harness.
+It scans `samples/**/*.wav` recursively:
+- quality regression runs on WAV files that already have a sibling `.txt` reference
+- focused checks (segmented conditioning, streaming, stream-cache equivalence) use fixed targets
+
+Generate references (using the larger model and full-context decode):
+
+```bash
+./asr_regression.py --generate-missing \
+    --binary ./qwen_asr --model-dir qwen3-asr-1.7b
+```
+
+Run regression checks:
+
+```bash
+./asr_regression.py \
+    --binary ./qwen_asr --model-dir qwen3-asr-1.7b
+```
+
+Or run the default regression profile via make:
+
+```bash
+make test
+```
+
+Streaming cache equivalence regression (cache on vs off):
+
+```bash
+./asr_regression.py --stream-cache-check-only \
+    --binary ./qwen_asr --stream-cache-model-dir qwen3-asr-0.6b
+```
+
+Or via make:
+
+```bash
+make test-stream-cache
+```
+
+Output format:
+- Each sample starts with a progress line: `START i/N`.
+- Live model text is shown while that sample is transcribed.
+- The sample closes with `DONE: OK i/N` (only `OK` is green) or `DONE: FAIL i/N` (status in red).
+
+Example:
+
+```text
+[START 1/22] jfk.wav ...
+And so, my fellow Americans, ask not what your country can do for you...
+[DONE: OK 1/22] jfk.wav | exact 0/108 (0.000) | norm 0/104 (0.000) | 2.6s
+```
+
+Per sample, the tool reports two distances:
+- `exact`: character-level Levenshtein distance on raw text.
+- `norm`: character-level Levenshtein distance after normalization
+  (punctuation -> spaces, lowercase, whitespace collapsed).
+
+### Fuzzing
+
+The parsers that consume **untrusted bytes** — a WAV you didn't author, a model
+file you downloaded — are fuzzed with **libFuzzer + AddressSanitizer + UBSan**
+(the same Homebrew LLVM toolchain the rest of the build uses; Apple clang ships
+no libFuzzer runtime). Four coverage-guided harnesses live in `fuzz/`:
+
+| Harness | Target | What it hunts |
+|---|---|---|
+| `fuzz_wav` | `qwen_parse_wav_buffer()` | RIFF/WAV header fields (sizes, channels, rate, bit depth) flowing into allocation + resampling math — integer overflow / OOB writes |
+| `fuzz_safetensors` | `safetensors_open/data/get_f32/get_bf16_direct()` | header offsets/sizes that lie about tensor extents — out-of-bounds reads against the mmap |
+| `fuzz_mel` | `qwen_mel_spectrogram()` | arbitrary floats incl. NaN/Inf and boundary lengths (0/1/few) through the windowing/FFT/frame-count math |
+| `fuzz_tokenizer` | `qwen_tokenizer_encode/decode()` | adversarial/truncated UTF-8 through byte-level BPE; unchecked token ids read OOB on decode |
+
+```bash
+make fuzz                 # build all four fuzzers (ASan+UBSan)
+make fuzz-wav             # fuzz one target (FUZZ_SECONDS=14400 = 4h default)
+make fuzz-safetensors
+make fuzz-tokenizer
+make fuzz-mel
+make overnight FUZZ_SECONDS=28800   # build + run every target unattended (8h each)
+```
+
+Runs use libFuzzer **fork mode** (`-fork=2`, `-ignore_crashes/timeouts/ooms`) so a
+crash is logged and fuzzing *continues* — an overnight run collects every distinct
+failure instead of stopping at the first. The corpus persists under
+`fuzz/corpus/<target>/` (the WAV target seeds from `samples/*.wav`; others get a
+minimal valid seed), and each unique crash is saved as
+`fuzz/findings/<target>-crash-<hash>`. Reproduce one by re-running the fuzzer on
+that file: `./fuzz/fuzz_wav fuzz/findings/wav-crash-<hash>`.
+
+Harness sources, the libFuzzer dictionary, and small boundary seeds are committed;
+the built fuzzers, corpus, and crash artifacts are generated and git-ignored.
+
+Separately, `make sanitize` builds the **whole engine** under ASan+UBSan, and
+`make sanitize-test` runs the regression suite through it to catch memory errors
+on the normal (non-fuzz) code paths.
 
 ## License
 
