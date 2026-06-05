@@ -221,7 +221,11 @@ static int map_insert(str_int_entry_t *map, int cap, char *key, int value) {
         }
         if (strcmp(map[idx].key, key) == 0) {
             map[idx].value = value;
-            return 0;
+            /* Duplicate: we keep the existing stored key and do NOT take `key`.
+             * Return non-zero so an owning caller frees its now-unused `key`
+             * (the merge-map caller does `if (map_insert(...)!=0) free(key)`);
+             * callers that pass a borrowed key just ignore the return value. */
+            return 1;
         }
     }
     return -1;

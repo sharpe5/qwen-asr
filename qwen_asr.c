@@ -710,7 +710,9 @@ static char *decode_segment_from_enc(qwen_ctx_t *ctx, float *enc_output, int enc
             size_t piece_len = strlen(piece);
             if (text_len + piece_len + 1 > text_cap) {
                 while (text_len + piece_len + 1 > text_cap) text_cap *= 2;
-                text = (char *)realloc(text, text_cap);
+                char *rtmp = (char *)realloc(text, text_cap);
+                if (!rtmp) break;  /* OOM: realloc kept the old buffer; stop appending, return partial */
+                text = rtmp;
             }
             memcpy(text + text_len, piece, piece_len);
             text_len += piece_len;
@@ -1521,7 +1523,9 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
         size_t need = result_len + add_len + (size_t)(need_space ? 2 : 1);
         if (need > result_cap) {
             while (need > result_cap) result_cap *= 2;
-            result = (char *)realloc(result, result_cap);
+            char *rtmp = (char *)realloc(result, result_cap);
+            if (!rtmp) break;  /* OOM: realloc kept the old buffer; stop appending, return partial */
+            result = rtmp;
         }
         if (need_space) {
             result[result_len++] = ' ';
@@ -2532,7 +2536,9 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                     size_t plen = strlen(piece);
                     if (result_len + plen + 1 > result_cap) {
                         while (result_len + plen + 1 > result_cap) result_cap *= 2;
-                        result = (char *)realloc(result, result_cap);
+                        char *rtmp = (char *)realloc(result, result_cap);
+                        if (!rtmp) break;  /* OOM: realloc kept the old buffer; stop appending, return partial */
+                        result = rtmp;
                     }
                     memcpy(result + result_len, piece, plen);
                     result_len += plen;

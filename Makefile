@@ -43,7 +43,7 @@ FUZZ_BASE    = -g -O1 -Wno-date-time $(SNDFILE_CFLAGS) -DUSE_BLAS -DACCELERATE_N
 FUZZ_LDLIBS  = -lm -lpthread -framework Accelerate $(SNDFILE_LIBS)
 FUZZ_OBJS    = $(SRCS:.c=.fuzz.o)
 FUZZ_DIR     = fuzz
-FUZZ_BINS    = $(FUZZ_DIR)/fuzz_wav $(FUZZ_DIR)/fuzz_safetensors
+FUZZ_BINS    = $(FUZZ_DIR)/fuzz_wav $(FUZZ_DIR)/fuzz_safetensors $(FUZZ_DIR)/fuzz_tokenizer $(FUZZ_DIR)/fuzz_mel
 # Per-target wall-clock budget for an overnight run (seconds); override on the CLI.
 FUZZ_SECONDS ?= 14400        # 4h each => ~8h to fuzz both targets
 FUZZ_RSS_MB  ?= 4096
@@ -56,7 +56,7 @@ FUZZ_FORKS   ?= 2
 .DEFAULT_GOAL := help
 
 .PHONY: all clean debug info help blas gpu gpu_link test test-gpu test-stream-cache \
-        check-llvm check-model sanitize sanitize-test sanitize-gpu fuzz fuzz-wav fuzz-safetensors overnight
+        check-llvm check-model sanitize sanitize-test sanitize-gpu tsan fuzz fuzz-wav fuzz-safetensors fuzz-tokenizer fuzz-mel overnight
 
 # Fail early with a clear message if the Homebrew LLVM toolchain is missing.
 check-llvm:
@@ -190,6 +190,18 @@ sanitize-test: check-model sanitize
 	  ./asr_regression.py --binary ./$(TARGET) --model-dir $(MODEL_DIR) 2>&1 \
 	  | tee $(FUZZ_DIR)/findings/sanitize-$$(date +%Y%m%d-%H%M%S).log
 
+# ThreadSanitizer build — detects data races in the pthread thread pool
+# (qwen_asr_kernels.c). Separate from ASan (the two cannot be combined). No
+# -ffast-math. Run the regression / a few transcriptions to exercise the pool.
+TSAN_CFLAGS = -Wall -Wextra -g -O1 -march=native -Wno-date-time $(SNDFILE_CFLAGS) \
+              -DUSE_BLAS -DACCELERATE_NEW_LAPACK -fsanitize=thread
+tsan: check-llvm
+	@$(MAKE) clean
+	@$(MAKE) $(TARGET) CC="$(CC)" CFLAGS="$(TSAN_CFLAGS)" \
+	         LDFLAGS="-lm -lpthread -framework Accelerate $(SNDFILE_LIBS) -fsanitize=thread"
+	@echo ""
+	@echo "Built ThreadSanitizer build — run a transcription to check for data races"
+
 # =============================================================================
 # Fuzzing (libFuzzer + ASan + UBSan). Shared objects are built with
 # -fsanitize=fuzzer-no-link (coverage, no main); each harness links the libFuzzer
@@ -219,7 +231,7 @@ define RUN_FUZZER
 	ASAN_OPTIONS=abort_on_error=1:detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
 	  $(FUZZ_DIR)/fuzz_$(1) -fork=$(FUZZ_FORKS) \
 	  -ignore_crashes=1 -ignore_timeouts=1 -ignore_ooms=1 \
-	  -max_total_time=$(FUZZ_SECONDS) -rss_limit_mb=$(FUZZ_RSS_MB) \
+	  -max_total_time=$(FUZZ_SECONDS) -rss_limit_mb=$(FUZZ_RSS_MB) $(FUZZ_EXTRA) \
 	  -print_final_stats=1 -artifact_prefix=$(FUZZ_DIR)/findings/$(1)-crash- \
 	  $(FUZZ_DIR)/corpus/$(2) 2>&1 \
 	  | tee $(FUZZ_DIR)/findings/$(1)-$$(date +%Y%m%d-%H%M%S).log
@@ -236,6 +248,16 @@ fuzz-safetensors: $(FUZZ_DIR)/fuzz_safetensors
 	@test -s $(FUZZ_DIR)/corpus/safetensors/seed-empty || \
 	  printf '\002\000\000\000\000\000\000\000{}' > $(FUZZ_DIR)/corpus/safetensors/seed-empty
 	$(call RUN_FUZZER,safetensors,safetensors)
+
+fuzz-tokenizer: $(FUZZ_DIR)/fuzz_tokenizer
+	@mkdir -p $(FUZZ_DIR)/corpus/tokenizer
+	@test -s $(FUZZ_DIR)/corpus/tokenizer/seed || \
+	  printf 'Hello, world! CPU CUDA PostgreSQL Redis 123' > $(FUZZ_DIR)/corpus/tokenizer/seed
+	$(call RUN_FUZZER,tokenizer,tokenizer)
+
+fuzz-mel: $(FUZZ_DIR)/fuzz_mel
+	@mkdir -p $(FUZZ_DIR)/corpus/mel
+	$(call RUN_FUZZER,mel,mel)
 
 # Unattended overnight run: build everything, then fuzz both targets in sequence.
 # The leading '-' lets the second fuzzer run even if the first finds a crash
