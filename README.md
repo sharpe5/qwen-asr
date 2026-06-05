@@ -4,8 +4,6 @@ This is a C implementation of the inference pipeline for [Qwen3-ASR](https://git
 
 On **Apple Silicon** there is also an optional **GPU mode** (`make gpu`, then `--gpu`): the Qwen3 decoder runs on the **Metal GPU** through CoreML while the encoder stays in portable C. It works for both model sizes, is selected automatically from `-d`, and on longer audio decodes roughly **3× faster** than the CPU path (measured on an M3 Ultra). The CPU/BLAS backend remains the default, and is the only backend you need off macOS.
 
-**Important**: this implementation explicitly **avoids implementing support for MPS**. Transcription systems are very important pieces of infrastructure, and are often run on remote Linux servers. Adding the MPS target would focus the efforts too much on Apple hardware, so for now I'm skipping it. The code runs very well anyway on Apple hardware (NEON optimized). Please, **don't send pull requests** about this feature, fork the code instead, in order to add MPS support. I'll add it much later when the other optimizations are already mature. (The optional `--gpu` decoder above is a thin CoreML bridge, not a hand-written MPS compute backend — the core engine stays portable C.)
-
 ## Table of Contents
 
 - [Supported Modes and Models](#supported-modes-and-models)
