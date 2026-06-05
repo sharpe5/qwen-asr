@@ -14,6 +14,8 @@ Audio can be piped from stdin (`--stdin`), making it easy to transcode and trans
 
 Both the 0.6B and 1.7B parameters models are supported. While the 1.7B model is generally more powerful, the 0.6B model seems the sweet spot for CPU inference, however the speed difference is not huge, so you may want to try both and decide what to use depending on your use case.
 
+Two execution backends are available: **CPU/BLAS** (the default, `make blas`, cross-platform) and, on Apple Silicon, a **GPU** decoder (`make gpu` + `--gpu`) that runs the Qwen3 decoder on the Metal GPU via CoreML. The GPU path works for both model sizes and is selected automatically from `-d` — see [Building](#building) and [How Fast Is It?](#how-fast-is-it) for measured M3 Ultra numbers.
+
 ## Quick Start
 
 ```bash
@@ -38,6 +40,7 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 ## Features
 
 - **Almost zero dependencies**: Pure C implementation. Needs BLAS (Accelerate on macOS, OpenBLAS on Linux); optional libsndfile enables Opus/Ogg/FLAC/MP3 input.
+- **Two backends — CPU (BLAS) and GPU**: `make blas` runs entirely on the CPU via BLAS, everywhere. On Apple Silicon, `make gpu` additionally runs the decoder on the **Metal GPU** via CoreML (`--gpu`), for both the 0.6B and 1.7B models — measured on an Apple **M3 Ultra**. See [Building](#building).
 - **Both models**: Automatically detects Qwen3-ASR-0.6B or 1.7B from the weight files.
 - **Streaming output**: Tokens are printed to stdout as they are generated, word by word, even in offline mode (no `--stream`).
 - **Streaming mode**: `--stream` processes audio in chunks with prefix rollback. A sliding window bounds encoder and decoder context for indefinite streaming.
@@ -469,8 +472,19 @@ on the normal (non-fuzz) code paths.
 
 ## How Fast Is It?
 
-Benchmarks were recomputed on **Apple M3 Max** (128GB RAM) with `make blas` (single run per row).
+The detailed BLAS tables below were recomputed on **Apple M3 Max** (128GB RAM) with `make blas` (single run per row).
 `Inference`/`Audio` are from program summary. `wall` includes model-load and process overhead.
+
+### CPU (BLAS) vs GPU — Apple M3 Ultra
+
+GPU decode (`make gpu`, then `--gpu -S 28`) vs CPU/BLAS offline (`-S 0`), as realtime multiples (higher is faster), measured on an **Apple M3 Ultra** (28-core, 96GB):
+
+| Clip | Audio | 0.6B CPU | 0.6B GPU | 1.7B CPU | 1.7B GPU |
+|------|-------|----------|----------|----------|----------|
+| `samples/jfk.wav` | 11s | 13.2× | 11.7× | 7.6× | 8.3× |
+| `119s_…another_broadcast.wav` | 119s | 12.1× | **36.3×** | 7.9× | **25.0×** |
+
+On short clips the GPU's per-segment dispatch overhead makes it a wash; on longer audio its batched multi-segment decode pulls roughly **3× ahead** for both model sizes. (The encoder runs in C either way; `--gpu` accelerates the decoder, and the package is auto-selected from `-d`.)
 
 ### Offline Mode (Full + Segmented)
 
